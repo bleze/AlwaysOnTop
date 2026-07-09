@@ -5,18 +5,21 @@
 #include <shellapi.h>
 
 #include <string>
+#include <vector>
 
 namespace {
 
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kAboutMenuId = 1000;
 constexpr UINT kQuitMenuId = 1001;
+constexpr UINT kManageMenuId = 1002;
 constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
 constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook.dll";
 constexpr int kMenuIconSize = 16;
 constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
+constexpr wchar_t kManageMenuText[] = L"&Manage Pinned Windows...";
 constexpr wchar_t kQuitMenuText[] = L"&Quit";
 
 using StartHooksFn = bool (*)();
@@ -28,11 +31,13 @@ NOTIFYICONDATAW g_trayIcon = {};
 HMENU g_trayMenu = nullptr;
 HICON g_appIcon = nullptr;
 HICON g_quitIcon = nullptr;
+HICON g_manageIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
 
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
+INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 
 [[nodiscard]] std::wstring GetExecutableDirectory()
 {
@@ -87,7 +92,8 @@ void UnloadHookModule()
     g_startHooks = nullptr;
 }
 
-[[nodiscard]] HICON CreateQuitIcon(int size)
+template <typename DrawGlyphFn>
+[[nodiscard]] HICON CreateGlyphIcon(int size, COLORREF color, DrawGlyphFn drawGlyph)
 {
     HDC screenDc = GetDC(nullptr);
     HDC colorDc = CreateCompatibleDC(screenDc);
@@ -104,21 +110,13 @@ void UnloadHookModule()
     FillRect(maskDc, &full, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     FillRect(colorDc, &full, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
 
-    HPEN colorPen = CreatePen(PS_SOLID, 2, RGB(196, 43, 28));
+    HPEN colorPen = CreatePen(PS_SOLID, 2, color);
     HPEN maskPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
     HPEN oldColorPen = static_cast<HPEN>(SelectObject(colorDc, colorPen));
     HPEN oldMaskPen = static_cast<HPEN>(SelectObject(maskDc, maskPen));
 
-    const int inset = size / 4;
-    MoveToEx(colorDc, inset, inset, nullptr);
-    LineTo(colorDc, size - inset, size - inset);
-    MoveToEx(colorDc, size - inset, inset, nullptr);
-    LineTo(colorDc, inset, size - inset);
-
-    MoveToEx(maskDc, inset, inset, nullptr);
-    LineTo(maskDc, size - inset, size - inset);
-    MoveToEx(maskDc, size - inset, inset, nullptr);
-    LineTo(maskDc, inset, size - inset);
+    drawGlyph(colorDc, size);
+    drawGlyph(maskDc, size);
 
     SelectObject(colorDc, oldColorPen);
     SelectObject(maskDc, oldMaskPen);
@@ -141,6 +139,29 @@ void UnloadHookModule()
     DeleteObject(maskBitmap);
 
     return icon;
+}
+
+[[nodiscard]] HICON CreateQuitIcon(int size)
+{
+    return CreateGlyphIcon(size, RGB(196, 43, 28), [](HDC dc, int s) {
+        const int inset = s / 4;
+        MoveToEx(dc, inset, inset, nullptr);
+        LineTo(dc, s - inset, s - inset);
+        MoveToEx(dc, s - inset, inset, nullptr);
+        LineTo(dc, inset, s - inset);
+    });
+}
+
+[[nodiscard]] HICON CreateManageIcon(int size)
+{
+    return CreateGlyphIcon(size, RGB(60, 110, 200), [](HDC dc, int s) {
+        const int left = s / 5;
+        const int right = s - s / 5;
+        for (int y : {s / 4, s / 2, (s * 3) / 4}) {
+            MoveToEx(dc, left, y, nullptr);
+            LineTo(dc, right, y);
+        }
+    });
 }
 
 void DrawMenuIconAndText(const DRAWITEMSTRUCT& item, HICON icon, const wchar_t* text)
@@ -182,6 +203,11 @@ void ShowAboutDialog()
     DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_ABOUT), g_hostWindow, AboutDialogProc);
 }
 
+void ShowManageDialog()
+{
+    DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_MANAGE), g_hostWindow, ManageDialogProc);
+}
+
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
 {
     switch (message) {
@@ -206,6 +232,148 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
             EndDialog(dialog, IDOK);
             return TRUE;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    return FALSE;
+}
+
+BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam)
+{
+    auto* windows = reinterpret_cast<std::vector<HWND>*>(lParam);
+
+    if (!IsWindowVisible(hwnd) || GetParent(hwnd) != nullptr) {
+        return TRUE;
+    }
+
+    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+        return TRUE;
+    }
+
+    wchar_t className[64] = {};
+    if (GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) == 0) {
+        return TRUE;
+    }
+
+    if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"WorkerW") == 0) {
+        return TRUE;
+    }
+
+    if (GetSystemMenu(hwnd, FALSE) == nullptr) {
+        return TRUE;
+    }
+
+    wchar_t title[256] = {};
+    if (GetWindowTextW(hwnd, title, static_cast<int>(std::size(title))) == 0) {
+        return TRUE;
+    }
+
+    windows->push_back(hwnd);
+    return TRUE;
+}
+
+void PopulateManageList(HWND dialog)
+{
+    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    SendMessageW(listBox, LB_RESETCONTENT, 0, 0);
+
+    std::vector<HWND> windows;
+    EnumWindows(CollectTopmostWindowsProc, reinterpret_cast<LPARAM>(&windows));
+
+    for (HWND hwnd : windows) {
+        wchar_t title[256] = {};
+        GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+
+        const int index = static_cast<int>(
+            SendMessageW(listBox, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(title)));
+        if (index >= 0) {
+            SendMessageW(listBox, LB_SETITEMDATA, index, reinterpret_cast<LPARAM>(hwnd));
+        }
+    }
+}
+
+void TurnOffTopmost(HWND hwnd)
+{
+    if (hwnd != nullptr && IsWindow(hwnd)) {
+        SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void TurnOffSelectedWindows(HWND dialog)
+{
+    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    const int selectedCount = static_cast<int>(SendMessageW(listBox, LB_GETSELCOUNT, 0, 0));
+    if (selectedCount <= 0) {
+        return;
+    }
+
+    std::vector<int> indices(selectedCount);
+    SendMessageW(listBox, LB_GETSELITEMS, selectedCount, reinterpret_cast<LPARAM>(indices.data()));
+
+    for (int index : indices) {
+        TurnOffTopmost(reinterpret_cast<HWND>(SendMessageW(listBox, LB_GETITEMDATA, index, 0)));
+    }
+
+    PopulateManageList(dialog);
+}
+
+void TurnOffAllWindows(HWND dialog)
+{
+    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    const int count = static_cast<int>(SendMessageW(listBox, LB_GETCOUNT, 0, 0));
+
+    for (int index = 0; index < count; ++index) {
+        TurnOffTopmost(reinterpret_cast<HWND>(SendMessageW(listBox, LB_GETITEMDATA, index, 0)));
+    }
+
+    PopulateManageList(dialog);
+}
+
+INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+{
+    switch (message) {
+    case WM_INITDIALOG:
+        SetWindowPos(
+            dialog,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        PopulateManageList(dialog);
+        return TRUE;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_MANAGE_TURNOFF_SELECTED:
+            TurnOffSelectedWindows(dialog);
+            return TRUE;
+        case IDC_MANAGE_TURNOFF_ALL:
+            TurnOffAllWindows(dialog);
+            return TRUE;
+        case IDC_MANAGE_REFRESH:
+            PopulateManageList(dialog);
+            return TRUE;
+        case IDOK:
+        case IDCANCEL:
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        default:
+            break;
         }
         break;
 
@@ -254,6 +422,9 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         case kAboutMenuId:
             ShowAboutDialog();
             return 0;
+        case kManageMenuId:
+            ShowManageDialog();
+            return 0;
         case kQuitMenuId:
             DestroyWindow(hwnd);
             return 0;
@@ -276,6 +447,9 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (drawItem != nullptr && drawItem->CtlType == ODT_MENU) {
             switch (drawItem->itemID) {
+            case kManageMenuId:
+                DrawMenuIconAndText(*drawItem, g_manageIcon, kManageMenuText);
+                return TRUE;
             case kAboutMenuId:
                 DrawMenuIconAndText(*drawItem, g_appIcon, kAboutMenuText);
                 return TRUE;
@@ -302,6 +476,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_quitIcon != nullptr) {
             DestroyIcon(g_quitIcon);
             g_quitIcon = nullptr;
+        }
+        if (g_manageIcon != nullptr) {
+            DestroyIcon(g_manageIcon);
+            g_manageIcon = nullptr;
         }
         UnloadHookModule();
         PostQuitMessage(0);
@@ -350,12 +528,15 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
     g_quitIcon = CreateQuitIcon(kMenuIconSize);
+    g_manageIcon = CreateManageIcon(kMenuIconSize);
 
     g_trayMenu = CreatePopupMenu();
     if (g_trayMenu == nullptr) {
         return false;
     }
 
+    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kManageMenuId, nullptr);
+    AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kAboutMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kQuitMenuId, nullptr);
