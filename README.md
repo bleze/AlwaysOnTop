@@ -29,6 +29,13 @@ build/Release/AlwaysOnTopHook.dll
 
 Both files must stay in the same directory.
 
+## Releases
+
+Pushing a tag matching `v*.*.*` (e.g. `v0.1.0`) triggers a GitHub Actions
+workflow that builds the Release binaries, packages them into an Inno Setup
+installer, and publishes both the installer and a portable zip to a GitHub
+Release.
+
 ## Usage
 
 1. Run `AlwaysOnTop.exe`.
