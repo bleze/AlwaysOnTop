@@ -1,0 +1,16 @@
+build/
+out/
+.vs/
+*.user
+*.suo
+*.sln.docstates
+CMakeUserPresets.json
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.iobj
+*.ipdb
