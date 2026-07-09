@@ -1,0 +1,9 @@
+#pragma once
+
+#define IDI_APP_ICON 101
+#define IDD_ABOUT 102
+
+#define IDC_STATIC -1
+#define IDC_ABOUT_TITLE 1001
+#define IDC_ABOUT_DESCRIPTION 1002
+#define IDC_ABOUT_VERSION 1003

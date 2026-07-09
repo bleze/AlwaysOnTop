@@ -1,5 +1,7 @@
 #include "AlwaysOnTop/Shared.h"
 
+#include "resource.h"
+
 #include <shellapi.h>
 
 #include <string>
@@ -7,6 +9,7 @@
 namespace {
 
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
+constexpr UINT kAboutMenuId = 1000;
 constexpr UINT kExitMenuId = 1001;
 constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
@@ -19,9 +22,12 @@ HINSTANCE g_instance = nullptr;
 HWND g_hostWindow = nullptr;
 NOTIFYICONDATAW g_trayIcon = {};
 HMENU g_trayMenu = nullptr;
+HICON g_appIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
+
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 
 [[nodiscard]] std::wstring GetExecutableDirectory()
 {
@@ -86,6 +92,37 @@ void ShowStartupError()
         MB_ICONERROR | MB_OK);
 }
 
+void ShowAboutDialog()
+{
+    DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_ABOUT), g_hostWindow, AboutDialogProc);
+}
+
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+{
+    switch (message) {
+    case WM_INITDIALOG:
+        SendDlgItemMessageW(
+            dialog,
+            IDC_ABOUT_TITLE,
+            WM_SETFONT,
+            reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+            TRUE);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    return FALSE;
+}
+
 void RemoveTrayIcon()
 {
     if (g_hostWindow != nullptr) {
@@ -120,16 +157,27 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == kExitMenuId) {
+        switch (LOWORD(wParam)) {
+        case kAboutMenuId:
+            ShowAboutDialog();
+            return 0;
+        case kExitMenuId:
             DestroyWindow(hwnd);
+            return 0;
+        default:
+            break;
         }
-        return 0;
+        break;
 
     case WM_DESTROY:
         RemoveTrayIcon();
         if (g_trayMenu != nullptr) {
             DestroyMenu(g_trayMenu);
             g_trayMenu = nullptr;
+        }
+        if (g_appIcon != nullptr) {
+            DestroyIcon(g_appIcon);
+            g_appIcon = nullptr;
         }
         UnloadHookModule();
         PostQuitMessage(0);
@@ -148,6 +196,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     windowClass.lpfnWndProc = HostWindowProc;
     windowClass.hInstance = g_instance;
     windowClass.lpszClassName = kWindowClassName;
+    windowClass.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     return RegisterClassW(&windowClass) != 0;
 }
 
@@ -177,7 +226,14 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return false;
     }
 
+    AppendMenuW(g_trayMenu, MF_STRING, kAboutMenuId, L"&About AlwaysOnTop...");
+    AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_STRING, kExitMenuId, L"E&xit");
+
+    g_appIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    if (g_appIcon == nullptr) {
+        g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
 
     g_trayIcon = {};
     g_trayIcon.cbSize = sizeof(g_trayIcon);
@@ -185,8 +241,8 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     g_trayIcon.uID = 1;
     g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_trayIcon.uCallbackMessage = kTrayCallbackMessage;
-    g_trayIcon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_trayIcon.szTip, L"AlwaysOnTop");
+    g_trayIcon.hIcon = g_appIcon;
+    wcscpy_s(g_trayIcon.szTip, L"AlwaysOnTop - right-click title bars to pin windows");
 
     return Shell_NotifyIconW(NIM_ADD, &g_trayIcon) != FALSE;
 }

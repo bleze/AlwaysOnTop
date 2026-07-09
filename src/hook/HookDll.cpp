@@ -7,6 +7,17 @@ namespace {
 HINSTANCE g_instance = nullptr;
 HHOOK g_shellHook = nullptr;
 HHOOK g_getMessageHook = nullptr;
+HHOOK g_callWndProcHook = nullptr;
+
+[[nodiscard]] HWND ResolveRootWindow(HWND hwnd)
+{
+    if (hwnd == nullptr) {
+        return nullptr;
+    }
+
+    const HWND root = GetAncestor(hwnd, GA_ROOT);
+    return root != nullptr ? root : hwnd;
+}
 
 [[nodiscard]] bool IsTopLevelWindow(HWND hwnd)
 {
@@ -57,8 +68,8 @@ void ToggleAlwaysOnTop(HWND hwnd)
 
 void UpdateMenuCheckState(HWND hwnd, HMENU menu)
 {
-    const UINT flags = IsAlwaysOnTop(hwnd) ? MF_CHECKED : MF_UNCHECKED;
-    CheckMenuItem(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND | flags);
+    const UINT checkFlags = IsAlwaysOnTop(hwnd) ? MF_CHECKED : MF_UNCHECKED;
+    CheckMenuItem(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND | checkFlags);
 }
 
 void EnsureAlwaysOnTopMenu(HWND hwnd)
@@ -72,13 +83,37 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
         return;
     }
 
+    if (GetPropW(hwnd, kMenuInjectedProp) != nullptr &&
+        GetMenuState(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND) == static_cast<UINT>(-1)) {
+        RemovePropW(hwnd, kMenuInjectedProp);
+    }
+
     if (GetPropW(hwnd, kMenuInjectedProp) == nullptr) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kAlwaysOnTopCommandId, L"Always on &Top");
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_UNCHECKED,
+            kAlwaysOnTopCommandId,
+            L"&Always on Top");
         SetPropW(hwnd, kMenuInjectedProp, reinterpret_cast<HANDLE>(1));
     }
 
     UpdateMenuCheckState(hwnd, menu);
+}
+
+void RefreshSystemMenu(HWND hwnd, HMENU menu)
+{
+    hwnd = ResolveRootWindow(hwnd);
+    if (hwnd == nullptr) {
+        return;
+    }
+
+    HMENU systemMenu = GetSystemMenu(hwnd, FALSE);
+    if (systemMenu == nullptr || menu != systemMenu) {
+        return;
+    }
+
+    EnsureAlwaysOnTopMenu(hwnd);
 }
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
@@ -100,6 +135,20 @@ LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_shellHook, code, wParam, lParam);
 }
 
+LRESULT CALLBACK CallWndProcHookProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code >= 0) {
+        const auto* callInfo = reinterpret_cast<CWPSTRUCT*>(lParam);
+        if (callInfo != nullptr && callInfo->message == WM_INITMENU) {
+            RefreshSystemMenu(
+                callInfo->hwnd,
+                reinterpret_cast<HMENU>(callInfo->wParam));
+        }
+    }
+
+    return CallNextHookEx(g_callWndProcHook, code, wParam, lParam);
+}
+
 LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code >= 0 && wParam == PM_REMOVE) {
@@ -108,16 +157,21 @@ LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
             return CallNextHookEx(g_getMessageHook, code, wParam, lParam);
         }
 
-        HWND hwnd = message->hwnd;
-        if (message->message == WM_INITMENUPOPUP) {
-            HMENU menu = reinterpret_cast<HMENU>(message->wParam);
-            HMENU systemMenu = GetSystemMenu(hwnd, FALSE);
-            if (systemMenu != nullptr && menu == systemMenu) {
-                EnsureAlwaysOnTopMenu(hwnd);
-            }
+        HWND hwnd = ResolveRootWindow(message->hwnd);
+        if (message->message == WM_INITMENU) {
+            RefreshSystemMenu(hwnd, reinterpret_cast<HMENU>(message->wParam));
+        } else if (message->message == WM_INITMENUPOPUP &&
+                   HIWORD(message->lParam) == 0) {
+            RefreshSystemMenu(hwnd, reinterpret_cast<HMENU>(message->wParam));
         } else if (message->message == WM_SYSCOMMAND &&
                    (message->wParam & 0xFFF0) == kAlwaysOnTopCommandId) {
             ToggleAlwaysOnTop(hwnd);
+
+            HMENU menu = GetSystemMenu(hwnd, FALSE);
+            if (menu != nullptr) {
+                UpdateMenuCheckState(hwnd, menu);
+            }
+
             message->message = WM_NULL;
         }
     }
@@ -137,12 +191,19 @@ extern "C" __declspec(dllexport) bool Aot_Start()
         g_shellHook = SetWindowsHookExW(WH_SHELL, ShellHookProc, g_instance, 0);
     }
 
+    if (g_callWndProcHook == nullptr) {
+        g_callWndProcHook =
+            SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHookProc, g_instance, 0);
+    }
+
     if (g_getMessageHook == nullptr) {
         g_getMessageHook = SetWindowsHookExW(WH_GETMESSAGE, GetMessageHookProc, g_instance, 0);
     }
 
     EnumWindows(EnumWindowsProc, 0);
-    return g_shellHook != nullptr && g_getMessageHook != nullptr;
+    return g_shellHook != nullptr &&
+           g_callWndProcHook != nullptr &&
+           g_getMessageHook != nullptr;
 }
 
 extern "C" __declspec(dllexport) void Aot_Stop()
@@ -150,6 +211,11 @@ extern "C" __declspec(dllexport) void Aot_Stop()
     if (g_shellHook != nullptr) {
         UnhookWindowsHookEx(g_shellHook);
         g_shellHook = nullptr;
+    }
+
+    if (g_callWndProcHook != nullptr) {
+        UnhookWindowsHookEx(g_callWndProcHook);
+        g_callWndProcHook = nullptr;
     }
 
     if (g_getMessageHook != nullptr) {
