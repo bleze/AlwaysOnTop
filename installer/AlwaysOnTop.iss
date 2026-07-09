@@ -32,7 +32,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "autostart"; Description: "Start AlwaysOnTop automatically when Windows starts"; GroupDescription: "Additional options:"; Flags: unchecked
+Name: "autostart"; Description: "Start AlwaysOnTop automatically when Windows starts"; GroupDescription: "Additional options:"
 
 [Files]
 Source: "..\build\Release\AlwaysOnTop.exe"; DestDir: "{app}"; Flags: ignoreversion
