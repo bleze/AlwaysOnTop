@@ -192,6 +192,14 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
             WM_SETFONT,
             reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
             TRUE);
+        SetWindowPos(
+            dialog,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         return TRUE;
 
     case WM_COMMAND:
