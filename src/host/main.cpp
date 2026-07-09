@@ -10,10 +10,14 @@ namespace {
 
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kAboutMenuId = 1000;
-constexpr UINT kExitMenuId = 1001;
+constexpr UINT kQuitMenuId = 1001;
 constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
 constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook.dll";
+constexpr int kMenuIconSize = 16;
+constexpr int kMenuItemHeight = 22;
+constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
+constexpr wchar_t kQuitMenuText[] = L"&Quit";
 
 using StartHooksFn = bool (*)();
 using StopHooksFn = void (*)();
@@ -23,6 +27,7 @@ HWND g_hostWindow = nullptr;
 NOTIFYICONDATAW g_trayIcon = {};
 HMENU g_trayMenu = nullptr;
 HICON g_appIcon = nullptr;
+HICON g_quitIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
@@ -80,6 +85,86 @@ void UnloadHookModule()
     }
 
     g_startHooks = nullptr;
+}
+
+[[nodiscard]] HICON CreateQuitIcon(int size)
+{
+    HDC screenDc = GetDC(nullptr);
+    HDC colorDc = CreateCompatibleDC(screenDc);
+    HDC maskDc = CreateCompatibleDC(screenDc);
+
+    HBITMAP colorBitmap = CreateCompatibleBitmap(screenDc, size, size);
+    HBITMAP maskBitmap = CreateBitmap(size, size, 1, 1, nullptr);
+    ReleaseDC(nullptr, screenDc);
+
+    HBITMAP oldColorBitmap = static_cast<HBITMAP>(SelectObject(colorDc, colorBitmap));
+    HBITMAP oldMaskBitmap = static_cast<HBITMAP>(SelectObject(maskDc, maskBitmap));
+
+    RECT full = {0, 0, size, size};
+    FillRect(maskDc, &full, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    FillRect(colorDc, &full, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+
+    HPEN colorPen = CreatePen(PS_SOLID, 2, RGB(196, 43, 28));
+    HPEN maskPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+    HPEN oldColorPen = static_cast<HPEN>(SelectObject(colorDc, colorPen));
+    HPEN oldMaskPen = static_cast<HPEN>(SelectObject(maskDc, maskPen));
+
+    const int inset = size / 4;
+    MoveToEx(colorDc, inset, inset, nullptr);
+    LineTo(colorDc, size - inset, size - inset);
+    MoveToEx(colorDc, size - inset, inset, nullptr);
+    LineTo(colorDc, inset, size - inset);
+
+    MoveToEx(maskDc, inset, inset, nullptr);
+    LineTo(maskDc, size - inset, size - inset);
+    MoveToEx(maskDc, size - inset, inset, nullptr);
+    LineTo(maskDc, inset, size - inset);
+
+    SelectObject(colorDc, oldColorPen);
+    SelectObject(maskDc, oldMaskPen);
+    DeleteObject(colorPen);
+    DeleteObject(maskPen);
+
+    SelectObject(colorDc, oldColorBitmap);
+    SelectObject(maskDc, oldMaskBitmap);
+    DeleteDC(colorDc);
+    DeleteDC(maskDc);
+
+    ICONINFO iconInfo = {};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmColor = colorBitmap;
+    iconInfo.hbmMask = maskBitmap;
+
+    HICON icon = CreateIconIndirect(&iconInfo);
+
+    DeleteObject(colorBitmap);
+    DeleteObject(maskBitmap);
+
+    return icon;
+}
+
+void DrawMenuIconAndText(const DRAWITEMSTRUCT& item, HICON icon, const wchar_t* text)
+{
+    const bool selected = (item.itemState & ODS_SELECTED) != 0;
+    HBRUSH background = CreateSolidBrush(GetSysColor(selected ? COLOR_HIGHLIGHT : COLOR_MENU));
+    FillRect(item.hDC, &item.rcItem, background);
+    DeleteObject(background);
+
+    const int iconX = item.rcItem.left + 6;
+    const int iconY = item.rcItem.top +
+        (item.rcItem.bottom - item.rcItem.top - kMenuIconSize) / 2;
+    if (icon != nullptr) {
+        DrawIconEx(item.hDC, iconX, iconY, icon, kMenuIconSize, kMenuIconSize, 0, nullptr, DI_NORMAL);
+    }
+
+    RECT textRect = item.rcItem;
+    textRect.left += 6 + kMenuIconSize + 8;
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+    HFONT oldFont = static_cast<HFONT>(
+        SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT)));
+    DrawTextW(item.hDC, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    SelectObject(item.hDC, oldFont);
 }
 
 void ShowStartupError()
@@ -161,13 +246,40 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         case kAboutMenuId:
             ShowAboutDialog();
             return 0;
-        case kExitMenuId:
+        case kQuitMenuId:
             DestroyWindow(hwnd);
             return 0;
         default:
             break;
         }
         break;
+
+    case WM_MEASUREITEM: {
+        auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (measure != nullptr && measure->CtlType == ODT_MENU) {
+            measure->itemWidth = 180;
+            measure->itemHeight = kMenuItemHeight;
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (drawItem != nullptr && drawItem->CtlType == ODT_MENU) {
+            switch (drawItem->itemID) {
+            case kAboutMenuId:
+                DrawMenuIconAndText(*drawItem, g_appIcon, kAboutMenuText);
+                return TRUE;
+            case kQuitMenuId:
+                DrawMenuIconAndText(*drawItem, g_quitIcon, kQuitMenuText);
+                return TRUE;
+            default:
+                break;
+            }
+        }
+        break;
+    }
 
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -178,6 +290,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_appIcon != nullptr) {
             DestroyIcon(g_appIcon);
             g_appIcon = nullptr;
+        }
+        if (g_quitIcon != nullptr) {
+            DestroyIcon(g_quitIcon);
+            g_quitIcon = nullptr;
         }
         UnloadHookModule();
         PostQuitMessage(0);
@@ -221,19 +337,20 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 
 [[nodiscard]] bool CreateTrayIcon()
 {
+    g_appIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    if (g_appIcon == nullptr) {
+        g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
+    g_quitIcon = CreateQuitIcon(kMenuIconSize);
+
     g_trayMenu = CreatePopupMenu();
     if (g_trayMenu == nullptr) {
         return false;
     }
 
-    AppendMenuW(g_trayMenu, MF_STRING, kAboutMenuId, L"&About AlwaysOnTop...");
+    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kAboutMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(g_trayMenu, MF_STRING, kExitMenuId, L"E&xit");
-
-    g_appIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
-    if (g_appIcon == nullptr) {
-        g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    }
+    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kQuitMenuId, nullptr);
 
     g_trayIcon = {};
     g_trayIcon.cbSize = sizeof(g_trayIcon);
