@@ -12,6 +12,6 @@ BEGIN
     LTEXT           "AlwaysOnTop", IDC_ABOUT_TITLE, 62, 18, 180, 14
     LTEXT           "Adds an Always on Top toggle to every window's system menu.\nRight-click a title bar, taskbar button, or press Alt+Space.",
                     IDC_ABOUT_DESCRIPTION, 62, 36, 180, 36
-    LTEXT           "Version 0.1.0", IDC_ABOUT_VERSION, 62, 78, 180, 12
+    LTEXT           "Version 0.1.1", IDC_ABOUT_VERSION, 62, 78, 180, 12
     DEFPUSHBUTTON   "OK", IDOK, 198, 108, 50, 16
 END
