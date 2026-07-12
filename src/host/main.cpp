@@ -3,10 +3,16 @@
 #include "resource.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 
 #include <string>
 #include <vector>
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 
 namespace {
 
@@ -36,9 +42,105 @@ HICON g_manageIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
+HBRUSH g_darkDialogBrush = nullptr;
 
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
+
+[[nodiscard]] bool IsSystemDarkModeEnabled()
+{
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme",
+        RRF_RT_REG_DWORD,
+        nullptr,
+        &value,
+        &size);
+    return status == ERROR_SUCCESS && value == 0;
+}
+
+void ApplyDarkTitleBar(HWND hwnd, bool dark)
+{
+    const BOOL enabled = dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
+}
+
+void ApplyDarkListView(HWND listView, bool dark)
+{
+    if (dark) {
+        SetWindowTheme(listView, L"DarkMode_Explorer", nullptr);
+        ListView_SetBkColor(listView, RGB(32, 32, 32));
+        ListView_SetTextColor(listView, RGB(240, 240, 240));
+        ListView_SetTextBkColor(listView, RGB(32, 32, 32));
+    } else {
+        SetWindowTheme(listView, L"Explorer", nullptr);
+        ListView_SetBkColor(listView, GetSysColor(COLOR_WINDOW));
+        ListView_SetTextColor(listView, GetSysColor(COLOR_WINDOWTEXT));
+        ListView_SetTextBkColor(listView, GetSysColor(COLOR_WINDOW));
+    }
+}
+
+void DrawOwnerButton(const DRAWITEMSTRUCT& item, bool dark)
+{
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const bool focused = (item.itemState & ODS_FOCUS) != 0;
+    const bool isDefault = item.CtlID == IDOK;
+
+    const COLORREF fill = dark
+        ? (pressed ? RGB(20, 20, 20) : RGB(51, 51, 51))
+        : (pressed ? RGB(200, 200, 200) : RGB(225, 225, 225));
+    const COLORREF border = isDefault
+        ? RGB(0, 120, 215)
+        : (dark ? RGB(90, 90, 90) : RGB(160, 160, 160));
+    const COLORREF text = dark ? RGB(240, 240, 240) : RGB(0, 0, 0);
+
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, isDefault ? 2 : 1, border);
+    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(item.hDC, brush));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
+
+    Rectangle(item.hDC, item.rcItem.left, item.rcItem.top, item.rcItem.right, item.rcItem.bottom);
+
+    SelectObject(item.hDC, oldBrush);
+    SelectObject(item.hDC, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+
+    wchar_t caption[128] = {};
+    GetWindowTextW(item.hwndItem, caption, static_cast<int>(std::size(caption)));
+
+    RECT textRect = item.rcItem;
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, text);
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(item.hwndItem, WM_GETFONT, 0, 0));
+    HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, font));
+    DrawTextW(item.hDC, caption, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(item.hDC, oldFont);
+
+    if (focused) {
+        RECT focusRect = item.rcItem;
+        InflateRect(&focusRect, -3, -3);
+        DrawFocusRect(item.hDC, &focusRect);
+    }
+}
+
+INT_PTR HandleDarkDialogColor(bool dark, HDC hdc)
+{
+    if (!dark) {
+        return FALSE;
+    }
+
+    if (g_darkDialogBrush == nullptr) {
+        g_darkDialogBrush = CreateSolidBrush(RGB(32, 32, 32));
+    }
+
+    SetTextColor(hdc, RGB(240, 240, 240));
+    SetBkColor(hdc, RGB(32, 32, 32));
+    return reinterpret_cast<INT_PTR>(g_darkDialogBrush);
+}
 
 [[nodiscard]] std::wstring GetExecutableDirectory()
 {
@@ -209,10 +311,14 @@ void ShowManageDialog()
     DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_MANAGE), g_hostWindow, ManageDialogProc);
 }
 
-INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
-    case WM_INITDIALOG:
+    case WM_INITDIALOG: {
+        const bool dark = IsSystemDarkModeEnabled();
+        SetWindowLongPtrW(dialog, GWLP_USERDATA, dark ? 1 : 0);
+        ApplyDarkTitleBar(dialog, dark);
+
         SendDlgItemMessageW(
             dialog,
             IDC_ABOUT_TITLE,
@@ -228,6 +334,22 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         return TRUE;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+        return HandleDarkDialogColor(
+            GetWindowLongPtrW(dialog, GWLP_USERDATA) != 0,
+            reinterpret_cast<HDC>(wParam));
+
+    case WM_DRAWITEM: {
+        auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (drawItem != nullptr && drawItem->CtlType == ODT_BUTTON) {
+            DrawOwnerButton(*drawItem, GetWindowLongPtrW(dialog, GWLP_USERDATA) != 0);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
@@ -406,10 +528,14 @@ void SetUpManageListColumns(HWND dialog)
     ListView_InsertColumn(listView, 1, &column);
 }
 
-INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
-    case WM_INITDIALOG:
+    case WM_INITDIALOG: {
+        const bool dark = IsSystemDarkModeEnabled();
+        SetWindowLongPtrW(dialog, GWLP_USERDATA, dark ? 1 : 0);
+        ApplyDarkTitleBar(dialog, dark);
+
         SetWindowPos(
             dialog,
             HWND_TOPMOST,
@@ -419,8 +545,25 @@ INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPAR
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetUpManageListColumns(dialog);
+        ApplyDarkListView(GetDlgItem(dialog, IDC_MANAGE_LIST), dark);
         PopulateManageList(dialog);
         return TRUE;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+        return HandleDarkDialogColor(
+            GetWindowLongPtrW(dialog, GWLP_USERDATA) != 0,
+            reinterpret_cast<HDC>(wParam));
+
+    case WM_DRAWITEM: {
+        auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (drawItem != nullptr && drawItem->CtlType == ODT_BUTTON) {
+            DrawOwnerButton(*drawItem, GetWindowLongPtrW(dialog, GWLP_USERDATA) != 0);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -545,6 +688,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_manageIcon != nullptr) {
             DestroyIcon(g_manageIcon);
             g_manageIcon = nullptr;
+        }
+        if (g_darkDialogBrush != nullptr) {
+            DeleteObject(g_darkDialogBrush);
+            g_darkDialogBrush = nullptr;
         }
         UnloadHookModule();
         PostQuitMessage(0);

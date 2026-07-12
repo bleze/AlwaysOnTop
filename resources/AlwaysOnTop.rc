@@ -4,6 +4,8 @@
 
 IDI_APP_ICON ICON "app.ico"
 
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "AlwaysOnTop.manifest"
+
 IDD_ABOUT DIALOGEX 0, 0, 260, 144
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "About AlwaysOnTop"
@@ -14,7 +16,7 @@ BEGIN
     LTEXT           "Adds Always on Top and Hide Window toggles to every window's system menu.\nRight-click a title bar, taskbar button, or press Alt+Space.\nHidden windows can only be restored from Manage Windows.",
                     IDC_ABOUT_DESCRIPTION, 62, 36, 180, 48
     LTEXT           "Version 0.2.0", IDC_ABOUT_VERSION, 62, 90, 180, 12
-    DEFPUSHBUTTON   "OK", IDOK, 198, 120, 50, 16
+    CONTROL         "OK", IDOK, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 198, 120, 50, 16
 END
 
 IDD_MANAGE DIALOGEX 0, 0, 280, 204
@@ -23,8 +25,8 @@ CAPTION "Manage Windows"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     CONTROL         "", IDC_MANAGE_LIST, "SysListView32", LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 8, 8, 264, 140
-    PUSHBUTTON      "Restore &Selected", IDC_MANAGE_RESTORE_SELECTED, 8, 152, 100, 16
-    PUSHBUTTON      "Restore &All", IDC_MANAGE_RESTORE_ALL, 112, 152, 80, 16
-    PUSHBUTTON      "&Refresh", IDC_MANAGE_REFRESH, 196, 152, 76, 16
-    DEFPUSHBUTTON   "Close", IDOK, 212, 176, 60, 16
+    CONTROL         "Restore &Selected", IDC_MANAGE_RESTORE_SELECTED, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 8, 152, 100, 16
+    CONTROL         "Restore &All", IDC_MANAGE_RESTORE_ALL, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 112, 152, 80, 16
+    CONTROL         "&Refresh", IDC_MANAGE_REFRESH, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 196, 152, 76, 16
+    CONTROL         "Close", IDOK, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 212, 176, 60, 16
 END

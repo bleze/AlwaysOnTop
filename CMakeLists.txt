@@ -21,7 +21,14 @@ add_executable(AlwaysOnTop WIN32
 
 target_include_directories(AlwaysOnTop PRIVATE include resources)
 target_compile_definitions(AlwaysOnTop PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
-target_link_libraries(AlwaysOnTop PRIVATE user32 shell32 comctl32)
+target_link_libraries(AlwaysOnTop PRIVATE user32 shell32 comctl32 dwmapi uxtheme)
+
+# The manifest is embedded manually via RT_MANIFEST in AlwaysOnTop.rc (for
+# Common Controls v6 + DPI awareness); disable the linker's own manifest
+# generation so it doesn't collide with resource id 1.
+if(MSVC)
+    set_target_properties(AlwaysOnTop PROPERTIES LINK_FLAGS "/MANIFEST:NO")
+endif()
 
 add_dependencies(AlwaysOnTop AlwaysOnTopHook)
 
