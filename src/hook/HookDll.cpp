@@ -72,6 +72,12 @@ void UpdateMenuCheckState(HWND hwnd, HMENU menu)
     CheckMenuItem(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND | checkFlags);
 }
 
+void HideWindow(HWND hwnd)
+{
+    ShowWindow(hwnd, SW_HIDE);
+    SetPropW(hwnd, kHiddenProp, reinterpret_cast<HANDLE>(1));
+}
+
 void EnsureAlwaysOnTopMenu(HWND hwnd)
 {
     if (!ShouldProcessWindow(hwnd)) {
@@ -95,6 +101,11 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
             MF_STRING | MF_UNCHECKED,
             kAlwaysOnTopCommandId,
             L"&Always on Top");
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            kHideWindowCommandId,
+            L"Hide &Window");
         SetPropW(hwnd, kMenuInjectedProp, reinterpret_cast<HANDLE>(1));
     }
 
@@ -129,6 +140,7 @@ LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
             EnsureAlwaysOnTopMenu(reinterpret_cast<HWND>(wParam));
         } else if (code == HSHELL_WINDOWDESTROYED) {
             RemovePropW(reinterpret_cast<HWND>(wParam), kMenuInjectedProp);
+            RemovePropW(reinterpret_cast<HWND>(wParam), kHiddenProp);
         }
     }
 
@@ -172,6 +184,10 @@ LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
                 UpdateMenuCheckState(hwnd, menu);
             }
 
+            message->message = WM_NULL;
+        } else if (message->message == WM_SYSCOMMAND &&
+                   (message->wParam & 0xFFF0) == kHideWindowCommandId) {
+            HideWindow(hwnd);
             message->message = WM_NULL;
         }
     }

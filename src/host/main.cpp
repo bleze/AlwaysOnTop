@@ -2,6 +2,7 @@
 
 #include "resource.h"
 
+#include <commctrl.h>
 #include <shellapi.h>
 
 #include <string>
@@ -19,7 +20,7 @@ constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook.dll";
 constexpr int kMenuIconSize = 16;
 constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
-constexpr wchar_t kManageMenuText[] = L"&Manage Pinned Windows...";
+constexpr wchar_t kManageMenuText[] = L"&Manage Windows...";
 constexpr wchar_t kQuitMenuText[] = L"&Quit";
 
 using StartHooksFn = bool (*)();
@@ -242,30 +243,56 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
     return FALSE;
 }
 
-BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam)
+[[nodiscard]] bool IsExcludedWindowClass(HWND hwnd)
+{
+    wchar_t className[64] = {};
+    if (GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) == 0) {
+        return true;
+    }
+
+    return wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"WorkerW") == 0;
+}
+
+[[nodiscard]] bool IsPinned(HWND hwnd)
+{
+    return (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+[[nodiscard]] bool IsHidden(HWND hwnd)
+{
+    return GetPropW(hwnd, kHiddenProp) != nullptr;
+}
+
+[[nodiscard]] std::wstring BuildStateText(bool pinned, bool hidden)
+{
+    if (pinned && hidden) {
+        return L"Pinned + Hidden";
+    }
+    if (pinned) {
+        return L"Pinned";
+    }
+    if (hidden) {
+        return L"Hidden";
+    }
+    return L"";
+}
+
+BOOL CALLBACK CollectManagedWindowsProc(HWND hwnd, LPARAM lParam)
 {
     auto* windows = reinterpret_cast<std::vector<HWND>*>(lParam);
 
-    if (!IsWindowVisible(hwnd) || GetParent(hwnd) != nullptr) {
+    if (GetParent(hwnd) != nullptr || IsExcludedWindowClass(hwnd)) {
         return TRUE;
     }
 
-    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+    if (IsHidden(hwnd)) {
+        windows->push_back(hwnd);
         return TRUE;
     }
 
-    wchar_t className[64] = {};
-    if (GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) == 0) {
-        return TRUE;
-    }
-
-    if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
-        wcscmp(className, L"Progman") == 0 ||
-        wcscmp(className, L"WorkerW") == 0) {
-        return TRUE;
-    }
-
-    if (GetSystemMenu(hwnd, FALSE) == nullptr) {
+    if (!IsPinned(hwnd) || !IsWindowVisible(hwnd) || GetSystemMenu(hwnd, FALSE) == nullptr) {
         return TRUE;
     }
 
@@ -280,27 +307,40 @@ BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam)
 
 void PopulateManageList(HWND dialog)
 {
-    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
-    SendMessageW(listBox, LB_RESETCONTENT, 0, 0);
+    HWND listView = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    ListView_DeleteAllItems(listView);
 
     std::vector<HWND> windows;
-    EnumWindows(CollectTopmostWindowsProc, reinterpret_cast<LPARAM>(&windows));
+    EnumWindows(CollectManagedWindowsProc, reinterpret_cast<LPARAM>(&windows));
 
+    int index = 0;
     for (HWND hwnd : windows) {
         wchar_t title[256] = {};
         GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
 
-        const int index = static_cast<int>(
-            SendMessageW(listBox, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(title)));
-        if (index >= 0) {
-            SendMessageW(listBox, LB_SETITEMDATA, index, reinterpret_cast<LPARAM>(hwnd));
+        LVITEMW item = {};
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = index;
+        item.pszText = title;
+        item.lParam = reinterpret_cast<LPARAM>(hwnd);
+        const int insertedIndex = ListView_InsertItem(listView, &item);
+        if (insertedIndex < 0) {
+            continue;
         }
+
+        std::wstring state = BuildStateText(IsPinned(hwnd), IsHidden(hwnd));
+        ListView_SetItemText(listView, insertedIndex, 1, state.data());
+        ++index;
     }
 }
 
-void TurnOffTopmost(HWND hwnd)
+void RestoreWindow(HWND hwnd)
 {
-    if (hwnd != nullptr && IsWindow(hwnd)) {
+    if (hwnd == nullptr || !IsWindow(hwnd)) {
+        return;
+    }
+
+    if (IsPinned(hwnd)) {
         SetWindowPos(
             hwnd,
             HWND_NOTOPMOST,
@@ -310,36 +350,60 @@ void TurnOffTopmost(HWND hwnd)
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+
+    if (IsHidden(hwnd)) {
+        ShowWindow(hwnd, SW_SHOW);
+        RemovePropW(hwnd, kHiddenProp);
+    }
 }
 
-void TurnOffSelectedWindows(HWND dialog)
+void RestoreSelectedWindows(HWND dialog)
 {
-    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
-    const int selectedCount = static_cast<int>(SendMessageW(listBox, LB_GETSELCOUNT, 0, 0));
-    if (selectedCount <= 0) {
-        return;
-    }
+    HWND listView = GetDlgItem(dialog, IDC_MANAGE_LIST);
 
-    std::vector<int> indices(selectedCount);
-    SendMessageW(listBox, LB_GETSELITEMS, selectedCount, reinterpret_cast<LPARAM>(indices.data()));
-
-    for (int index : indices) {
-        TurnOffTopmost(reinterpret_cast<HWND>(SendMessageW(listBox, LB_GETITEMDATA, index, 0)));
+    int index = -1;
+    while ((index = ListView_GetNextItem(listView, index, LVNI_SELECTED)) != -1) {
+        LVITEMW item = {};
+        item.mask = LVIF_PARAM;
+        item.iItem = index;
+        ListView_GetItem(listView, &item);
+        RestoreWindow(reinterpret_cast<HWND>(item.lParam));
     }
 
     PopulateManageList(dialog);
 }
 
-void TurnOffAllWindows(HWND dialog)
+void RestoreAllWindows(HWND dialog)
 {
-    HWND listBox = GetDlgItem(dialog, IDC_MANAGE_LIST);
-    const int count = static_cast<int>(SendMessageW(listBox, LB_GETCOUNT, 0, 0));
+    HWND listView = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    const int count = ListView_GetItemCount(listView);
 
     for (int index = 0; index < count; ++index) {
-        TurnOffTopmost(reinterpret_cast<HWND>(SendMessageW(listBox, LB_GETITEMDATA, index, 0)));
+        LVITEMW item = {};
+        item.mask = LVIF_PARAM;
+        item.iItem = index;
+        ListView_GetItem(listView, &item);
+        RestoreWindow(reinterpret_cast<HWND>(item.lParam));
     }
 
     PopulateManageList(dialog);
+}
+
+void SetUpManageListColumns(HWND dialog)
+{
+    HWND listView = GetDlgItem(dialog, IDC_MANAGE_LIST);
+    ListView_SetExtendedListViewStyle(listView, LVS_EX_FULLROWSELECT);
+
+    LVCOLUMNW column = {};
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+
+    column.pszText = const_cast<LPWSTR>(L"Window");
+    column.cx = 180;
+    ListView_InsertColumn(listView, 0, &column);
+
+    column.pszText = const_cast<LPWSTR>(L"State");
+    column.cx = 90;
+    ListView_InsertColumn(listView, 1, &column);
 }
 
 INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
@@ -354,16 +418,17 @@ INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPAR
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetUpManageListColumns(dialog);
         PopulateManageList(dialog);
         return TRUE;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDC_MANAGE_TURNOFF_SELECTED:
-            TurnOffSelectedWindows(dialog);
+        case IDC_MANAGE_RESTORE_SELECTED:
+            RestoreSelectedWindows(dialog);
             return TRUE;
-        case IDC_MANAGE_TURNOFF_ALL:
-            TurnOffAllWindows(dialog);
+        case IDC_MANAGE_RESTORE_ALL:
+            RestoreAllWindows(dialog);
             return TRUE;
         case IDC_MANAGE_REFRESH:
             PopulateManageList(dialog);
@@ -548,7 +613,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_trayIcon.uCallbackMessage = kTrayCallbackMessage;
     g_trayIcon.hIcon = g_appIcon;
-    wcscpy_s(g_trayIcon.szTip, L"AlwaysOnTop - right-click title bars to pin windows");
+    wcscpy_s(g_trayIcon.szTip, L"AlwaysOnTop - right-click title bars to pin or hide windows");
 
     return Shell_NotifyIconW(NIM_ADD, &g_trayIcon) != FALSE;
 }
@@ -571,6 +636,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
         return 0;
     }
+
+    INITCOMMONCONTROLSEX commonControls = {};
+    commonControls.dwSize = sizeof(commonControls);
+    commonControls.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&commonControls);
 
     if (!RegisterHostWindowClass() || !CreateHostWindow() || !CreateTrayIcon()) {
         CloseHandle(mutex);

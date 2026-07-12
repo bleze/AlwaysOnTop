@@ -1,29 +1,30 @@
 #include "resource.h"
 #include <winuser.h>
+#include <commctrl.h>
 
 IDI_APP_ICON ICON "app.ico"
 
-IDD_ABOUT DIALOGEX 0, 0, 260, 132
+IDD_ABOUT DIALOGEX 0, 0, 260, 144
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "About AlwaysOnTop"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     ICON            IDI_APP_ICON, IDC_STATIC, 18, 18, 32, 32
     LTEXT           "AlwaysOnTop", IDC_ABOUT_TITLE, 62, 18, 180, 14
-    LTEXT           "Adds an Always on Top toggle to every window's system menu.\nRight-click a title bar, taskbar button, or press Alt+Space.",
-                    IDC_ABOUT_DESCRIPTION, 62, 36, 180, 36
-    LTEXT           "Version 0.2.0", IDC_ABOUT_VERSION, 62, 78, 180, 12
-    DEFPUSHBUTTON   "OK", IDOK, 198, 108, 50, 16
+    LTEXT           "Adds Always on Top and Hide Window toggles to every window's system menu.\nRight-click a title bar, taskbar button, or press Alt+Space.\nHidden windows can only be restored from Manage Windows.",
+                    IDC_ABOUT_DESCRIPTION, 62, 36, 180, 48
+    LTEXT           "Version 0.2.0", IDC_ABOUT_VERSION, 62, 90, 180, 12
+    DEFPUSHBUTTON   "OK", IDOK, 198, 120, 50, 16
 END
 
-IDD_MANAGE DIALOGEX 0, 0, 240, 165
+IDD_MANAGE DIALOGEX 0, 0, 280, 204
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Always on Top Windows"
+CAPTION "Manage Windows"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LISTBOX         IDC_MANAGE_LIST, 8, 8, 224, 100, LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "Turn Off &Selected", IDC_MANAGE_TURNOFF_SELECTED, 8, 114, 92, 16
-    PUSHBUTTON      "Turn Off &All", IDC_MANAGE_TURNOFF_ALL, 104, 114, 60, 16
-    PUSHBUTTON      "&Refresh", IDC_MANAGE_REFRESH, 168, 114, 64, 16
-    DEFPUSHBUTTON   "Close", IDOK, 168, 138, 64, 16
+    CONTROL         "", IDC_MANAGE_LIST, "SysListView32", LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 8, 8, 264, 140
+    PUSHBUTTON      "Restore &Selected", IDC_MANAGE_RESTORE_SELECTED, 8, 152, 100, 16
+    PUSHBUTTON      "Restore &All", IDC_MANAGE_RESTORE_ALL, 112, 152, 80, 16
+    PUSHBUTTON      "&Refresh", IDC_MANAGE_REFRESH, 196, 152, 76, 16
+    DEFPUSHBUTTON   "Close", IDOK, 212, 176, 60, 16
 END

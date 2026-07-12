@@ -21,7 +21,7 @@ add_executable(AlwaysOnTop WIN32
 
 target_include_directories(AlwaysOnTop PRIVATE include resources)
 target_compile_definitions(AlwaysOnTop PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
-target_link_libraries(AlwaysOnTop PRIVATE user32 shell32)
+target_link_libraries(AlwaysOnTop PRIVATE user32 shell32 comctl32)
 
 add_dependencies(AlwaysOnTop AlwaysOnTopHook)
 
