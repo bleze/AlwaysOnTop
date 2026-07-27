@@ -1,5 +1,6 @@
 #include "AlwaysOnTop/Shared.h"
 
+#include "Updater.h"
 #include "resource.h"
 
 #include <commctrl.h>
@@ -7,6 +8,7 @@
 #include <shellapi.h>
 #include <uxtheme.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,7 @@ constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kAboutMenuId = 1000;
 constexpr UINT kQuitMenuId = 1001;
 constexpr UINT kManageMenuId = 1002;
+constexpr UINT kCheckUpdatesMenuId = 1003;
 constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
 constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook.dll";
@@ -27,7 +30,10 @@ constexpr int kMenuIconSize = 16;
 constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
 constexpr wchar_t kManageMenuText[] = L"&Manage Windows...";
+constexpr wchar_t kCheckUpdatesMenuText[] = L"Check for &Updates";
 constexpr wchar_t kQuitMenuText[] = L"&Quit";
+constexpr UINT_PTR kUpdateCheckTimerId = 1;
+constexpr UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
 
 using StartHooksFn = bool (*)();
 using StopHooksFn = void (*)();
@@ -39,6 +45,7 @@ HMENU g_trayMenu = nullptr;
 HICON g_appIcon = nullptr;
 HICON g_quitIcon = nullptr;
 HICON g_manageIcon = nullptr;
+HICON g_updateIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
@@ -264,6 +271,22 @@ template <typename DrawGlyphFn>
             MoveToEx(dc, left, y, nullptr);
             LineTo(dc, right, y);
         }
+    });
+}
+
+[[nodiscard]] HICON CreateUpdateIcon(int size)
+{
+    return CreateGlyphIcon(size, RGB(46, 160, 67), [](HDC dc, int s) {
+        const int midX = s / 2;
+        const int top = s / 5;
+        const int bottom = (s * 3) / 5;
+        MoveToEx(dc, midX, top, nullptr);
+        LineTo(dc, midX, bottom);
+        MoveToEx(dc, midX - s / 5, bottom - s / 5, nullptr);
+        LineTo(dc, midX, bottom);
+        LineTo(dc, midX + s / 5, bottom - s / 5);
+        MoveToEx(dc, s / 5, (s * 4) / 5, nullptr);
+        LineTo(dc, s - s / 5, (s * 4) / 5);
     });
 }
 
@@ -599,6 +622,38 @@ void RemoveTrayIcon()
     }
 }
 
+void ShowBalloonNotification(const std::wstring& title, const std::wstring& text)
+{
+    g_trayIcon.uFlags |= NIF_INFO;
+    wcscpy_s(g_trayIcon.szInfoTitle, title.c_str());
+    wcscpy_s(g_trayIcon.szInfo, text.c_str());
+    g_trayIcon.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &g_trayIcon);
+    g_trayIcon.uFlags &= ~NIF_INFO;
+}
+
+void HandleUpdateResult(const UpdateResult& result)
+{
+    if (result.hasError) {
+        if (result.manual) {
+            MessageBoxW(g_hostWindow, result.message.c_str(), L"AlwaysOnTop", MB_ICONWARNING | MB_OK);
+        }
+        return;
+    }
+
+    if (result.upToDate) {
+        if (result.manual) {
+            const std::wstring text = L"You're on the latest version (" + result.version + L").";
+            MessageBoxW(g_hostWindow, text.c_str(), L"AlwaysOnTop", MB_ICONINFORMATION | MB_OK);
+        }
+        return;
+    }
+
+    ShowBalloonNotification(
+        L"AlwaysOnTop is updating",
+        L"Downloading version " + result.version + L" - the app will restart automatically.");
+}
+
 void ShowTrayMenu()
 {
     POINT cursor = {};
@@ -633,6 +688,9 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         case kManageMenuId:
             ShowManageDialog();
             return 0;
+        case kCheckUpdatesMenuId:
+            CheckForUpdatesAsync(hwnd, true);
+            return 0;
         case kQuitMenuId:
             DestroyWindow(hwnd);
             return 0;
@@ -640,6 +698,20 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             break;
         }
         break;
+
+    case kUpdateResultMessage: {
+        std::unique_ptr<UpdateResult> result(reinterpret_cast<UpdateResult*>(lParam));
+        if (result != nullptr) {
+            HandleUpdateResult(*result);
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam == kUpdateCheckTimerId) {
+            CheckForUpdatesAsync(hwnd, false);
+        }
+        return 0;
 
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
@@ -658,6 +730,9 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             case kManageMenuId:
                 DrawMenuIconAndText(*drawItem, g_manageIcon, kManageMenuText);
                 return TRUE;
+            case kCheckUpdatesMenuId:
+                DrawMenuIconAndText(*drawItem, g_updateIcon, kCheckUpdatesMenuText);
+                return TRUE;
             case kAboutMenuId:
                 DrawMenuIconAndText(*drawItem, g_appIcon, kAboutMenuText);
                 return TRUE;
@@ -672,6 +747,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     }
 
     case WM_DESTROY:
+        KillTimer(hwnd, kUpdateCheckTimerId);
         RemoveTrayIcon();
         if (g_trayMenu != nullptr) {
             DestroyMenu(g_trayMenu);
@@ -688,6 +764,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_manageIcon != nullptr) {
             DestroyIcon(g_manageIcon);
             g_manageIcon = nullptr;
+        }
+        if (g_updateIcon != nullptr) {
+            DestroyIcon(g_updateIcon);
+            g_updateIcon = nullptr;
         }
         if (g_darkDialogBrush != nullptr) {
             DeleteObject(g_darkDialogBrush);
@@ -741,6 +821,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     }
     g_quitIcon = CreateQuitIcon(kMenuIconSize);
     g_manageIcon = CreateManageIcon(kMenuIconSize);
+    g_updateIcon = CreateUpdateIcon(kMenuIconSize);
 
     g_trayMenu = CreatePopupMenu();
     if (g_trayMenu == nullptr) {
@@ -748,6 +829,8 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     }
 
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kManageMenuId, nullptr);
+    AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kCheckUpdatesMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kAboutMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
@@ -800,6 +883,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         CloseHandle(mutex);
         return 1;
     }
+
+    CheckForUpdatesAsync(g_hostWindow, false);
+    SetTimer(g_hostWindow, kUpdateCheckTimerId, kUpdateCheckIntervalMs, nullptr);
 
     MSG message = {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

@@ -1,4 +1,5 @@
 #include "resource.h"
+#include "AlwaysOnTop/Version.h"
 #include <winuser.h>
 #include <commctrl.h>
 
@@ -15,7 +16,7 @@ BEGIN
     LTEXT           "AlwaysOnTop", IDC_ABOUT_TITLE, 62, 18, 180, 14
     LTEXT           "Adds Always on Top and Hide Window toggles to every window's system menu.\nRight-click a title bar, taskbar button, or press Alt+Space.\nHidden windows can only be restored from Manage Windows.",
                     IDC_ABOUT_DESCRIPTION, 62, 36, 180, 48
-    LTEXT           "Version 0.3.1", IDC_ABOUT_VERSION, 62, 90, 180, 12
+    LTEXT           AOT_VERSION_DISPLAY_STRING, IDC_ABOUT_VERSION, 62, 90, 180, 12
     CONTROL         "OK", IDOK, "BUTTON", BS_OWNERDRAW | WS_TABSTOP, 198, 120, 50, 16
 END
 
