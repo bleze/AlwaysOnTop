@@ -89,12 +89,24 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
         return;
     }
 
-    if (GetPropW(hwnd, kMenuInjectedProp) != nullptr &&
-        GetMenuState(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND) == static_cast<UINT>(-1)) {
-        RemovePropW(hwnd, kMenuInjectedProp);
-    }
+    // The menu itself is the source of truth: some hosts (Chromium-based apps in
+    // particular) rebuild their native system menu between opens, silently dropping
+    // our items. Re-check both ids on every call instead of trusting a window
+    // property, and if either is missing, drop any stray leftover of the other
+    // before re-appending the pair together so they always stay adjacent.
+    const bool hasAlwaysOnTop =
+        GetMenuState(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND) != static_cast<UINT>(-1);
+    const bool hasHideWindow =
+        GetMenuState(menu, kHideWindowCommandId, MF_BYCOMMAND) != static_cast<UINT>(-1);
 
-    if (GetPropW(hwnd, kMenuInjectedProp) == nullptr) {
+    if (!hasAlwaysOnTop || !hasHideWindow) {
+        if (hasAlwaysOnTop) {
+            DeleteMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
+        }
+        if (hasHideWindow) {
+            DeleteMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
+        }
+
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(
             menu,
@@ -106,7 +118,6 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
             MF_STRING,
             kHideWindowCommandId,
             L"Hide &Window");
-        SetPropW(hwnd, kMenuInjectedProp, reinterpret_cast<HANDLE>(1));
     }
 
     UpdateMenuCheckState(hwnd, menu);
@@ -139,7 +150,6 @@ LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
         if (code == HSHELL_WINDOWCREATED) {
             EnsureAlwaysOnTopMenu(reinterpret_cast<HWND>(wParam));
         } else if (code == HSHELL_WINDOWDESTROYED) {
-            RemovePropW(reinterpret_cast<HWND>(wParam), kMenuInjectedProp);
             RemovePropW(reinterpret_cast<HWND>(wParam), kHiddenProp);
         }
     }
@@ -195,6 +205,47 @@ LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_getMessageHook, code, wParam, lParam);
 }
 
+void RemoveAlwaysOnTopMenu(HWND hwnd)
+{
+    HMENU menu = GetSystemMenu(hwnd, FALSE);
+    if (menu == nullptr) {
+        return;
+    }
+
+    // Drop the separator we added immediately before our own item, if it's
+    // still there, then remove both items by id regardless of position.
+    const int count = GetMenuItemCount(menu);
+    for (int i = 0; i < count; ++i) {
+        if (GetMenuItemID(menu, i) == kAlwaysOnTopCommandId) {
+            if (i > 0) {
+                const UINT prevState = GetMenuState(menu, i - 1, MF_BYPOSITION);
+                if (prevState != static_cast<UINT>(-1) && (prevState & MF_SEPARATOR) != 0) {
+                    RemoveMenu(menu, i - 1, MF_BYPOSITION);
+                }
+            }
+            break;
+        }
+    }
+
+    RemoveMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
+    RemoveMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
+}
+
+void RestoreHiddenWindow(HWND hwnd)
+{
+    if (GetPropW(hwnd, kHiddenProp) != nullptr) {
+        ShowWindow(hwnd, SW_SHOW);
+        RemovePropW(hwnd, kHiddenProp);
+    }
+}
+
+BOOL CALLBACK CleanupWindowsProc(HWND hwnd, LPARAM)
+{
+    RemoveAlwaysOnTopMenu(hwnd);
+    RestoreHiddenWindow(hwnd);
+    return TRUE;
+}
+
 } // namespace
 
 extern "C" __declspec(dllexport) bool Aot_Start()
@@ -238,6 +289,8 @@ extern "C" __declspec(dllexport) void Aot_Stop()
         UnhookWindowsHookEx(g_getMessageHook);
         g_getMessageHook = nullptr;
     }
+
+    EnumWindows(CleanupWindowsProc, 0);
 }
 
 void Aot_SetInstance(HINSTANCE instance)
