@@ -651,7 +651,13 @@ void HandleUpdateResult(const UpdateResult& result)
 
     ShowBalloonNotification(
         L"AlwaysOnTop is updating",
-        L"Downloading version " + result.version + L" - the app will restart automatically.");
+        L"Installing version " + result.version + L" - the app will restart automatically.");
+
+    // The installer is already running in the background. Quit now instead of
+    // waiting to be closed externally: this releases our lock on the exe right
+    // away and avoids racing the installer's relaunch against our own shutdown
+    // (which would otherwise trip the single-instance mutex check on startup).
+    DestroyWindow(g_hostWindow);
 }
 
 void ShowTrayMenu()
