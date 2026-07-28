@@ -78,6 +78,17 @@ void HideWindow(HWND hwnd)
     SetPropW(hwnd, kHiddenProp, reinterpret_cast<HANDLE>(1));
 }
 
+[[nodiscard]] int FindMenuItemPosition(HMENU menu, UINT commandId)
+{
+    const int count = GetMenuItemCount(menu);
+    for (int i = 0; i < count; ++i) {
+        if (GetMenuItemID(menu, i) == static_cast<int>(commandId)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void EnsureAlwaysOnTopMenu(HWND hwnd)
 {
     if (!ShouldProcessWindow(hwnd)) {
@@ -91,15 +102,19 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
 
     // The menu itself is the source of truth: some hosts (Chromium-based apps in
     // particular) rebuild their native system menu between opens, silently dropping
-    // our items. Re-check both ids on every call instead of trusting a window
-    // property, and if either is missing, drop any stray leftover of the other
-    // before re-appending the pair together so they always stay adjacent.
-    const bool hasAlwaysOnTop =
-        GetMenuState(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND) != static_cast<UINT>(-1);
-    const bool hasHideWindow =
-        GetMenuState(menu, kHideWindowCommandId, MF_BYCOMMAND) != static_cast<UINT>(-1);
+    // our items, or splice their own items in between ours without removing either
+    // id. Re-check both ids and their relative position on every call instead of
+    // trusting a window property, and if either is missing or they're no longer
+    // adjacent, drop any stray leftover before re-appending the pair together so
+    // they always stay next to each other.
+    const int alwaysOnTopPos = FindMenuItemPosition(menu, kAlwaysOnTopCommandId);
+    const int hideWindowPos = FindMenuItemPosition(menu, kHideWindowCommandId);
+    const bool hasAlwaysOnTop = alwaysOnTopPos != -1;
+    const bool hasHideWindow = hideWindowPos != -1;
+    const bool isAdjacent =
+        hasAlwaysOnTop && hasHideWindow && hideWindowPos == alwaysOnTopPos + 1;
 
-    if (!hasAlwaysOnTop || !hasHideWindow) {
+    if (!hasAlwaysOnTop || !hasHideWindow || !isAdjacent) {
         if (hasAlwaysOnTop) {
             DeleteMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
         }
