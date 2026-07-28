@@ -632,6 +632,76 @@ void ShowBalloonNotification(const std::wstring& title, const std::wstring& text
     g_trayIcon.uFlags &= ~NIF_INFO;
 }
 
+// Swaps the running exe/dll for freshly downloaded ones and relaunches.
+//
+// AlwaysOnTopHook.dll is injected into essentially every window-owning
+// process on the desktop via the global hooks, so an installer that depends
+// on closing every app holding the file open (Restart Manager) is not
+// reliable here - there is no realistic way to close Explorer, every open
+// browser, etc. Instead we rename the current files aside (Windows permits
+// renaming a file that's still mapped/executing elsewhere, unlike an
+// in-place overwrite, which requires exclusive write access) and move the
+// freshly downloaded files into place, which needs nobody else to let go of
+// anything.
+void ApplyStagedUpdate(const std::wstring& stagedExePath, const std::wstring& stagedDllPath)
+{
+    const std::wstring directory = GetExecutableDirectory();
+    if (directory.empty()) {
+        return;
+    }
+
+    const std::wstring exePath = directory + L"\\AlwaysOnTop.exe";
+    const std::wstring dllPath = directory + L"\\" + kHookDllName;
+    const std::wstring exeOldPath = exePath + L".old";
+    const std::wstring dllOldPath = dllPath + L".old";
+
+    // Release our own hold on the hook DLL before swapping it out; the other
+    // processes it's injected into don't need to do anything similar because
+    // the rename below doesn't require exclusive access.
+    UnloadHookModule();
+
+    DeleteFileW(exeOldPath.c_str());
+    DeleteFileW(dllOldPath.c_str());
+    MoveFileExW(exePath.c_str(), exeOldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+    MoveFileExW(dllPath.c_str(), dllOldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+
+    const bool exeMoved =
+        MoveFileExW(stagedExePath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+    const bool dllMoved =
+        MoveFileExW(stagedDllPath.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+
+    if (!exeMoved || !dllMoved) {
+        // Don't leave the install with neither version usable.
+        MoveFileExW(exeOldPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(dllOldPath.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        return;
+    }
+
+    std::wstring commandLine = L"\"" + exePath + L"\"";
+    STARTUPINFOW startupInfo = {};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo = {};
+    if (CreateProcessW(
+            exePath.c_str(),
+            commandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            0,
+            nullptr,
+            directory.c_str(),
+            &startupInfo,
+            &processInfo)) {
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+    }
+
+    DeleteFileW(exeOldPath.c_str());
+    DeleteFileW(dllOldPath.c_str());
+
+    DestroyWindow(g_hostWindow);
+}
+
 void HandleUpdateResult(const UpdateResult& result)
 {
     if (result.hasError) {
@@ -649,15 +719,12 @@ void HandleUpdateResult(const UpdateResult& result)
         return;
     }
 
-    ShowBalloonNotification(
-        L"AlwaysOnTop is updating",
-        L"Installing version " + result.version + L" - the app will restart automatically.");
-
-    // The installer is already running in the background. Quit now instead of
-    // waiting to be closed externally: this releases our lock on the exe right
-    // away and avoids racing the installer's relaunch against our own shutdown
-    // (which would otherwise trip the single-instance mutex check on startup).
-    DestroyWindow(g_hostWindow);
+    if (result.readyToInstall) {
+        ShowBalloonNotification(
+            L"AlwaysOnTop is updating",
+            L"Installing version " + result.version + L" - the app will restart automatically.");
+        ApplyStagedUpdate(result.stagedExePath, result.stagedDllPath);
+    }
 }
 
 void ShowTrayMenu()
@@ -860,16 +927,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
     g_instance = instance;
 
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+    // A self-update relaunches the new exe right as the old instance is
+    // tearing down; retry briefly instead of immediately reporting "already
+    // running" so that race doesn't strand the user on the old version.
+    HANDLE mutex = nullptr;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+        if (mutex != nullptr && GetLastError() != ERROR_ALREADY_EXISTS) {
+            break;
+        }
+        if (mutex != nullptr) {
+            CloseHandle(mutex);
+            mutex = nullptr;
+        }
+        Sleep(100);
+    }
+
+    if (mutex == nullptr) {
         MessageBoxW(
             nullptr,
             L"AlwaysOnTop is already running.",
             L"AlwaysOnTop",
             MB_ICONINFORMATION | MB_OK);
-        if (mutex != nullptr) {
-            CloseHandle(mutex);
-        }
         return 0;
     }
 

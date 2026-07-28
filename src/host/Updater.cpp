@@ -266,14 +266,6 @@ struct ParsedVersion
     return ok;
 }
 
-[[nodiscard]] std::wstring StripLeadingV(std::wstring tag)
-{
-    if (!tag.empty() && (tag[0] == L'v' || tag[0] == L'V')) {
-        tag.erase(0, 1);
-    }
-    return tag;
-}
-
 struct UpdateThreadArgs
 {
     HWND notifyWindow = nullptr;
@@ -317,52 +309,34 @@ DWORD WINAPI UpdateThreadProc(LPVOID param)
         return 0;
     }
 
-    const std::wstring versionNumber = StripLeadingV(tag);
-    const std::wstring assetName = L"AlwaysOnTop-Setup-" + versionNumber + L".exe";
-    const std::wstring downloadPath =
-        L"/" + std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/" + assetName;
+    const std::wstring exeDownloadPath =
+        L"/" + std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/AlwaysOnTop.exe";
+    const std::wstring dllDownloadPath =
+        L"/" + std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/AlwaysOnTopHook.dll";
 
     wchar_t tempDir[MAX_PATH] = {};
     GetTempPathW(static_cast<DWORD>(std::size(tempDir)), tempDir);
-    const std::wstring installerPath = std::wstring(tempDir) + assetName;
+    const std::wstring stagedExePath = std::wstring(tempDir) + L"AlwaysOnTop-update.exe";
+    const std::wstring stagedDllPath = std::wstring(tempDir) + L"AlwaysOnTopHook-update.dll";
 
-    if (!DownloadToFile(kAssetHost, downloadPath, installerPath) ||
-        !LooksLikeExecutable(installerPath)) {
-        DeleteFileW(installerPath.c_str());
+    const bool exeOk = DownloadToFile(kAssetHost, exeDownloadPath, stagedExePath) &&
+        LooksLikeExecutable(stagedExePath);
+    const bool dllOk = exeOk && DownloadToFile(kAssetHost, dllDownloadPath, stagedDllPath) &&
+        LooksLikeExecutable(stagedDllPath);
+
+    if (!exeOk || !dllOk) {
+        DeleteFileW(stagedExePath.c_str());
+        DeleteFileW(stagedDllPath.c_str());
         result->hasError = true;
         result->message = L"Failed to download the update.";
         PostResult(args->notifyWindow, std::move(result));
         return 0;
     }
 
-    std::wstring commandLine = L"\"" + installerPath + L"\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
-
-    STARTUPINFOW startupInfo = {};
-    startupInfo.cb = sizeof(startupInfo);
-    PROCESS_INFORMATION processInfo = {};
-    const bool launched = CreateProcessW(
-        nullptr,
-        commandLine.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        0,
-        nullptr,
-        nullptr,
-        &startupInfo,
-        &processInfo);
-
-    if (!launched) {
-        result->hasError = true;
-        result->message = L"Failed to launch the update installer.";
-        PostResult(args->notifyWindow, std::move(result));
-        return 0;
-    }
-
-    CloseHandle(processInfo.hThread);
-    CloseHandle(processInfo.hProcess);
-
+    result->readyToInstall = true;
     result->version = tag;
+    result->stagedExePath = stagedExePath;
+    result->stagedDllPath = stagedDllPath;
     PostResult(args->notifyWindow, std::move(result));
     return 0;
 }

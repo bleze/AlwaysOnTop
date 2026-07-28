@@ -50,4 +50,6 @@ jobs:
           files: |
             dist/AlwaysOnTop-Setup-${{ steps.version.outputs.version }}.exe
             dist/AlwaysOnTop-${{ steps.version.outputs.version }}-portable.zip
+            build/Release/AlwaysOnTop.exe
+            build/Release/AlwaysOnTopHook.dll
           generate_release_notes: true
