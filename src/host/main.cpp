@@ -37,6 +37,7 @@ constexpr UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
 
 using StartHooksFn = bool (*)();
 using StopHooksFn = void (*)();
+using UnhookOnlyFn = void (*)();
 
 HINSTANCE g_instance = nullptr;
 HWND g_hostWindow = nullptr;
@@ -49,6 +50,7 @@ HICON g_updateIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
+UnhookOnlyFn g_unhookOnly = nullptr;
 HBRUSH g_darkDialogBrush = nullptr;
 
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
@@ -183,10 +185,14 @@ INT_PTR HandleDarkDialogColor(bool dark, HDC hdc)
         GetProcAddress(g_hookModule, kStartHooksExport));
     g_stopHooks = reinterpret_cast<StopHooksFn>(
         GetProcAddress(g_hookModule, kStopHooksExport));
+    g_unhookOnly = reinterpret_cast<UnhookOnlyFn>(
+        GetProcAddress(g_hookModule, kUnhookOnlyExport));
 
     return g_startHooks != nullptr && g_stopHooks != nullptr;
 }
 
+// Full teardown: unhooks and restores every window this app had hidden, since
+// nothing else will get the chance to unhide them once we're gone for good.
 void UnloadHookModule()
 {
     if (g_stopHooks != nullptr) {
@@ -200,6 +206,31 @@ void UnloadHookModule()
     }
 
     g_startHooks = nullptr;
+    g_unhookOnly = nullptr;
+}
+
+// Releases the DLL for a self-update without touching window state: the
+// relaunched process picks the same windows back up, so hidden windows must
+// stay hidden and system menu items must stay put across the swap. Falls
+// back to the full teardown if the new export isn't present (e.g. updating
+// from an older build that predates it).
+void UnloadHookModuleForUpdate()
+{
+    if (g_unhookOnly != nullptr) {
+        g_unhookOnly();
+        g_stopHooks = nullptr;
+    } else if (g_stopHooks != nullptr) {
+        g_stopHooks();
+        g_stopHooks = nullptr;
+    }
+
+    if (g_hookModule != nullptr) {
+        FreeLibrary(g_hookModule);
+        g_hookModule = nullptr;
+    }
+
+    g_startHooks = nullptr;
+    g_unhookOnly = nullptr;
 }
 
 template <typename DrawGlyphFn>
@@ -658,7 +689,7 @@ void ApplyStagedUpdate(const std::wstring& stagedExePath, const std::wstring& st
     // Release our own hold on the hook DLL before swapping it out; the other
     // processes it's injected into don't need to do anything similar because
     // the rename below doesn't require exclusive access.
-    UnloadHookModule();
+    UnloadHookModuleForUpdate();
 
     DeleteFileW(exeOldPath.c_str());
     DeleteFileW(dllOldPath.c_str());

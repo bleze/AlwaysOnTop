@@ -14,3 +14,7 @@ constexpr const wchar_t* kHiddenProp = L"AlwaysOnTop.Hidden";
 // Export names used by the host executable.
 constexpr const char* kStartHooksExport = "Aot_Start";
 constexpr const char* kStopHooksExport = "Aot_Stop";
+// Unhooks without touching any window state (no restoring hidden windows or
+// stripping menu items). Used to release the DLL for an in-place self-update,
+// where the same window state should carry over to the relaunched process.
+constexpr const char* kUnhookOnlyExport = "Aot_Unhook";

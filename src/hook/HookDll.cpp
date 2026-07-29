@@ -300,7 +300,7 @@ extern "C" __declspec(dllexport) bool Aot_Start()
            g_getMessageHook != nullptr;
 }
 
-extern "C" __declspec(dllexport) void Aot_Stop()
+extern "C" __declspec(dllexport) void Aot_Unhook()
 {
     if (g_shellHook != nullptr) {
         UnhookWindowsHookEx(g_shellHook);
@@ -316,7 +316,11 @@ extern "C" __declspec(dllexport) void Aot_Stop()
         UnhookWindowsHookEx(g_getMessageHook);
         g_getMessageHook = nullptr;
     }
+}
 
+extern "C" __declspec(dllexport) void Aot_Stop()
+{
+    Aot_Unhook();
     EnumWindows(CleanupWindowsProc, 0);
 }
 
