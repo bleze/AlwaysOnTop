@@ -122,7 +122,19 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
             DeleteMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
         }
 
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        // Deleting the items above can leave a stray separator we added on a
+        // previous pass (some hosts rebuild the menu without removing it).
+        // Don't stack a second one on top of it.
+        const int countAfterDelete = GetMenuItemCount(menu);
+        const UINT lastState = countAfterDelete > 0
+            ? GetMenuState(menu, countAfterDelete - 1, MF_BYPOSITION)
+            : static_cast<UINT>(-1);
+        const bool lastIsSeparator =
+            lastState != static_cast<UINT>(-1) && (lastState & MF_SEPARATOR) != 0;
+
+        if (!lastIsSeparator) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
         AppendMenuW(
             menu,
             MF_STRING | MF_UNCHECKED,
