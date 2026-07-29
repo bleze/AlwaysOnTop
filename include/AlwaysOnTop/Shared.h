@@ -2,6 +2,18 @@
 
 #include <windows.h>
 
+#include <string>
+
+// Strips a leading "v"/"V" from a release tag ("v0.4.7" -> "0.4.7"), matching
+// the bare PROJECT_VERSION string used to name per-version build outputs.
+[[nodiscard]] inline std::wstring StripVersionTagPrefix(std::wstring text)
+{
+    if (!text.empty() && (text[0] == L'v' || text[0] == L'V')) {
+        text.erase(0, 1);
+    }
+    return text;
+}
+
 // Custom system-menu command ids. Must stay below 0xF000 (that range is reserved
 // for Windows' own SC_* system commands) and keep their low 4 bits zero, since
 // WM_SYSCOMMAND handling masks wParam with 0xFFF0 before comparing.

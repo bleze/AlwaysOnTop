@@ -38,7 +38,7 @@ Name: "autostart"; Description: "Start AlwaysOnTop automatically when Windows st
 
 [Files]
 Source: "..\build\Release\AlwaysOnTop.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\Release\AlwaysOnTopHook.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\Release\AlwaysOnTopHook-{#MyAppVersion}.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

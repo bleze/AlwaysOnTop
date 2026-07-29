@@ -41,7 +41,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path build\Release\AlwaysOnTop.exe, build\Release\AlwaysOnTopHook.dll `
+          Compress-Archive -Path build\Release\AlwaysOnTop.exe, "build\Release\AlwaysOnTopHook-${{ steps.version.outputs.version }}.dll" `
             -DestinationPath "dist\AlwaysOnTop-${{ steps.version.outputs.version }}-portable.zip"
 
       - name: Publish GitHub Release
@@ -51,5 +51,5 @@ jobs:
             dist/AlwaysOnTop-Setup-${{ steps.version.outputs.version }}.exe
             dist/AlwaysOnTop-${{ steps.version.outputs.version }}-portable.zip
             build/Release/AlwaysOnTop.exe
-            build/Release/AlwaysOnTopHook.dll
+            build/Release/AlwaysOnTopHook-${{ steps.version.outputs.version }}.dll
           generate_release_notes: true

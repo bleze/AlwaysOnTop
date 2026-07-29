@@ -1,5 +1,6 @@
 #include "Updater.h"
 
+#include "AlwaysOnTop/Shared.h"
 #include "AlwaysOnTop/Version.h"
 
 #include <winhttp.h>
@@ -311,8 +312,8 @@ DWORD WINAPI UpdateThreadProc(LPVOID param)
 
     const std::wstring exeDownloadPath =
         L"/" + std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/AlwaysOnTop.exe";
-    const std::wstring dllDownloadPath =
-        L"/" + std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/AlwaysOnTopHook.dll";
+    const std::wstring dllDownloadPath = L"/" + std::wstring(kRepoPath) +
+        L"/releases/download/" + tag + L"/AlwaysOnTopHook-" + StripVersionTagPrefix(tag) + L".dll";
 
     wchar_t tempDir[MAX_PATH] = {};
     GetTempPathW(static_cast<DWORD>(std::size(tempDir)), tempDir);

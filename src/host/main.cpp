@@ -1,4 +1,5 @@
 #include "AlwaysOnTop/Shared.h"
+#include "AlwaysOnTop/Version.h"
 
 #include "Updater.h"
 #include "resource.h"
@@ -25,7 +26,12 @@ constexpr UINT kManageMenuId = 1002;
 constexpr UINT kCheckUpdatesMenuId = 1003;
 constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
-constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook.dll";
+// Named per-version (see the matching comment on the CMake target) so a
+// self-update never has to rename or delete a copy some other process still
+// has mapped; it just adds a new file and this build only ever looks for its
+// own.
+constexpr wchar_t kHookDllName[] = L"AlwaysOnTopHook-" AOT_VERSION_STRING_W L".dll";
+constexpr wchar_t kHookDllPrefix[] = L"AlwaysOnTopHook";
 constexpr int kMenuIconSize = 16;
 constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
@@ -189,6 +195,33 @@ INT_PTR HandleDarkDialogColor(bool dark, HDC hdc)
         GetProcAddress(g_hookModule, kUnhookOnlyExport));
 
     return g_startHooks != nullptr && g_stopHooks != nullptr;
+}
+
+// Best-effort sweep of hook DLLs left behind by previous versions (including
+// the pre-versioned "AlwaysOnTopHook.dll"). Whichever ones are still mapped
+// into some other process simply fail to delete here and get tried again
+// next launch - harmless either way.
+void CleanupStaleHookDlls()
+{
+    const std::wstring directory = GetExecutableDirectory();
+    if (directory.empty()) {
+        return;
+    }
+
+    const std::wstring pattern = directory + L"\\" + kHookDllPrefix + L"*.dll";
+    WIN32_FIND_DATAW findData = {};
+    HANDLE findHandle = FindFirstFileW(pattern.c_str(), &findData);
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (wcscmp(findData.cFileName, kHookDllName) != 0) {
+            DeleteFileW((directory + L"\\" + findData.cFileName).c_str());
+        }
+    } while (FindNextFileW(findHandle, &findData));
+
+    FindClose(findHandle);
 }
 
 // Full teardown: unhooks and restores every window this app had hidden, since
@@ -663,18 +696,40 @@ void ShowBalloonNotification(const std::wstring& title, const std::wstring& text
     g_trayIcon.uFlags &= ~NIF_INFO;
 }
 
-// Swaps the running exe/dll for freshly downloaded ones and relaunches.
+// Freshly downloaded executables commonly get a brief exclusive lock from
+// antivirus real-time scanning; retry for a couple of seconds instead of
+// treating that transient sharing violation as a hard failure.
+[[nodiscard]] bool MoveFileWithRetry(const std::wstring& from, const std::wstring& to)
+{
+    constexpr int kAttempts = 10;
+    constexpr DWORD kRetryDelayMs = 200;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            return true;
+        }
+        Sleep(kRetryDelayMs);
+    }
+    return false;
+}
+
+// Swaps the running exe for a freshly downloaded one, drops the freshly
+// downloaded hook DLL in under its own versioned name, and relaunches.
 //
-// AlwaysOnTopHook.dll is injected into essentially every window-owning
-// process on the desktop via the global hooks, so an installer that depends
-// on closing every app holding the file open (Restart Manager) is not
-// reliable here - there is no realistic way to close Explorer, every open
-// browser, etc. Instead we rename the current files aside (Windows permits
-// renaming a file that's still mapped/executing elsewhere, unlike an
-// in-place overwrite, which requires exclusive write access) and move the
-// freshly downloaded files into place, which needs nobody else to let go of
-// anything.
-void ApplyStagedUpdate(const std::wstring& stagedExePath, const std::wstring& stagedDllPath)
+// AlwaysOnTopHook-<version>.dll is injected into essentially every
+// window-owning process on the desktop via the global hooks, and Windows only
+// releases each process's mapping of it lazily - the next time that process
+// happens to pump a hook-relevant message, which for idle background
+// processes may not happen for a long time. Renaming/overwriting the DLL in
+// place can then fail with ERROR_ACCESS_DENIED for as long as any other
+// process still has the old copy mapped. Since each version has its own
+// filename (see the CMake target), an update never touches the old DLL at
+// all - it only ever adds a new file, which nothing else could possibly have
+// open yet. The exe has no such problem (nothing but this process ever loads
+// it), so it's still swapped in place by renaming the current one aside.
+void ApplyStagedUpdate(
+    const std::wstring& stagedExePath,
+    const std::wstring& stagedDllPath,
+    const std::wstring& newDllPath)
 {
     const std::wstring directory = GetExecutableDirectory();
     if (directory.empty()) {
@@ -682,29 +737,37 @@ void ApplyStagedUpdate(const std::wstring& stagedExePath, const std::wstring& st
     }
 
     const std::wstring exePath = directory + L"\\AlwaysOnTop.exe";
-    const std::wstring dllPath = directory + L"\\" + kHookDllName;
     const std::wstring exeOldPath = exePath + L".old";
-    const std::wstring dllOldPath = dllPath + L".old";
 
-    // Release our own hold on the hook DLL before swapping it out; the other
-    // processes it's injected into don't need to do anything similar because
-    // the rename below doesn't require exclusive access.
+    // Unhook without touching window state before handing off to the
+    // relaunched process, so the old and new process don't both have active
+    // hooks during the changeover.
     UnloadHookModuleForUpdate();
 
     DeleteFileW(exeOldPath.c_str());
-    DeleteFileW(dllOldPath.c_str());
     MoveFileExW(exePath.c_str(), exeOldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-    MoveFileExW(dllPath.c_str(), dllOldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
 
-    const bool exeMoved =
-        MoveFileExW(stagedExePath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
-    const bool dllMoved =
-        MoveFileExW(stagedDllPath.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+    const bool exeMoved = MoveFileWithRetry(stagedExePath, exePath);
+    const bool dllMoved = exeMoved && MoveFileWithRetry(stagedDllPath, newDllPath);
 
     if (!exeMoved || !dllMoved) {
-        // Don't leave the install with neither version usable.
+        // Don't leave the install with no usable exe, and don't leave a
+        // half-applied new DLL lying around either.
         MoveFileExW(exeOldPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        MoveFileExW(dllOldPath.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        DeleteFileW(newDllPath.c_str());
+
+        // We're staying on this process (no relaunch), so re-install the
+        // hooks we released above - otherwise a failed update silently
+        // leaves the app running with no Always on Top/Hide Window support
+        // until the user notices and restarts it themselves.
+        if (LoadHookModule()) {
+            g_startHooks();
+        }
+
+        ShowBalloonNotification(
+            L"AlwaysOnTop update failed",
+            L"Couldn't install the update - still running the current version. "
+            L"It will try again at the next check.");
         return;
     }
 
@@ -728,7 +791,8 @@ void ApplyStagedUpdate(const std::wstring& stagedExePath, const std::wstring& st
     }
 
     DeleteFileW(exeOldPath.c_str());
-    DeleteFileW(dllOldPath.c_str());
+    // The now-unused old-versioned DLL is left in place - it may still be
+    // mapped into other processes; CleanupStaleHookDlls sweeps it up later.
 
     DestroyWindow(g_hostWindow);
 }
@@ -751,10 +815,14 @@ void HandleUpdateResult(const UpdateResult& result)
     }
 
     if (result.readyToInstall) {
+        const std::wstring directory = GetExecutableDirectory();
+        const std::wstring newDllPath = directory + L"\\" + kHookDllPrefix + L"-" +
+            StripVersionTagPrefix(result.version) + L".dll";
+
         ShowBalloonNotification(
             L"AlwaysOnTop is updating",
             L"Installing version " + result.version + L" - the app will restart automatically.");
-        ApplyStagedUpdate(result.stagedExePath, result.stagedDllPath);
+        ApplyStagedUpdate(result.stagedExePath, result.stagedDllPath, newDllPath);
     }
 }
 
@@ -999,6 +1067,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         CloseHandle(mutex);
         return 1;
     }
+
+    CleanupStaleHookDlls();
 
     CheckForUpdatesAsync(g_hostWindow, false);
     SetTimer(g_hostWindow, kUpdateCheckTimerId, kUpdateCheckIntervalMs, nullptr);
