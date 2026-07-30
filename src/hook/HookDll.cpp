@@ -78,15 +78,49 @@ void HideWindow(HWND hwnd)
     SetPropW(hwnd, kHiddenProp, reinterpret_cast<HANDLE>(1));
 }
 
-[[nodiscard]] int FindMenuItemPosition(HMENU menu, UINT commandId)
+// Window property marking that we added the separator immediately before our
+// own items ourselves, rather than reusing one the host already had there.
+constexpr const wchar_t* kOwnsLeadingSeparatorProp = L"AlwaysOnTop.OwnsLeadingSeparator";
+
+// Removes our pair and the trailing separator we always add right after it
+// (always safe to remove - nothing else could have put a separator there).
+// The leading separator is only removed if kOwnsLeadingSeparatorProp says we
+// added it ourselves last time; if we instead reused one the host already
+// had, it's left untouched, so we never permanently delete something the
+// host still relies on once our own items are gone. Safe to call when our
+// items are absent.
+void StripAlwaysOnTopItems(HWND hwnd, HMENU menu)
 {
-    const int count = GetMenuItemCount(menu);
-    for (int i = 0; i < count; ++i) {
-        if (GetMenuItemID(menu, i) == static_cast<int>(commandId)) {
-            return i;
+    // Trailing separator first, by position relative to HideWindow, before
+    // anything else shifts indices around.
+    for (int i = 0, count = GetMenuItemCount(menu); i < count; ++i) {
+        if (GetMenuItemID(menu, i) == kHideWindowCommandId) {
+            if (i + 1 < count) {
+                const UINT nextState = GetMenuState(menu, i + 1, MF_BYPOSITION);
+                if (nextState != static_cast<UINT>(-1) && (nextState & MF_SEPARATOR) != 0) {
+                    RemoveMenu(menu, i + 1, MF_BYPOSITION);
+                }
+            }
+            break;
         }
     }
-    return -1;
+
+    if (GetPropW(hwnd, kOwnsLeadingSeparatorProp) != nullptr) {
+        for (int i = 0, count = GetMenuItemCount(menu); i < count; ++i) {
+            if (GetMenuItemID(menu, i) == kAlwaysOnTopCommandId) {
+                if (i > 0) {
+                    const UINT prevState = GetMenuState(menu, i - 1, MF_BYPOSITION);
+                    if (prevState != static_cast<UINT>(-1) && (prevState & MF_SEPARATOR) != 0) {
+                        RemoveMenu(menu, i - 1, MF_BYPOSITION);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    RemoveMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
+    RemoveMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
 }
 
 void EnsureAlwaysOnTopMenu(HWND hwnd)
@@ -100,52 +134,52 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
         return;
     }
 
-    // The menu itself is the source of truth: some hosts (Chromium-based apps in
-    // particular) rebuild their native system menu between opens, silently dropping
-    // our items, or splice their own items in between ours without removing either
-    // id. Re-check both ids and their relative position on every call instead of
-    // trusting a window property, and if either is missing or they're no longer
-    // adjacent, drop any stray leftover before re-appending the pair together so
-    // they always stay next to each other.
-    const int alwaysOnTopPos = FindMenuItemPosition(menu, kAlwaysOnTopCommandId);
-    const int hideWindowPos = FindMenuItemPosition(menu, kHideWindowCommandId);
-    const bool hasAlwaysOnTop = alwaysOnTopPos != -1;
-    const bool hasHideWindow = hideWindowPos != -1;
-    const bool isAdjacent =
-        hasAlwaysOnTop && hasHideWindow && hideWindowPos == alwaysOnTopPos + 1;
+    // The menu itself is the source of truth: some hosts (Chromium-based apps
+    // in particular) rebuild their native system menu between opens, silently
+    // dropping our items or splicing their own in between ours. Captured logs
+    // show Brave's rebuild always inserts its dynamic block at "one position
+    // before whatever item is currently last" - so appending our pair at the
+    // true end (making one of them the last item) guarantees Brave's next
+    // rebuild lands its insert *inside* our pair, no matter how we time our
+    // own fix-up relative to that rebuild. Inserting our pair immediately
+    // before whatever the host's own last item is (e.g. "Close") instead
+    // keeps that item last, so Brave's insert keeps landing before it - a
+    // slot that was never ours to begin with.
+    StripAlwaysOnTopItems(hwnd, menu);
 
-    if (!hasAlwaysOnTop || !hasHideWindow || !isAdjacent) {
-        if (hasAlwaysOnTop) {
-            DeleteMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
-        }
-        if (hasHideWindow) {
-            DeleteMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
-        }
+    const int count = GetMenuItemCount(menu);
+    int insertPos = count > 0 ? count - 1 : 0;
 
-        // Deleting the items above can leave a stray separator we added on a
-        // previous pass (some hosts rebuild the menu without removing it).
-        // Don't stack a second one on top of it.
-        const int countAfterDelete = GetMenuItemCount(menu);
-        const UINT lastState = countAfterDelete > 0
-            ? GetMenuState(menu, countAfterDelete - 1, MF_BYPOSITION)
-            : static_cast<UINT>(-1);
-        const bool lastIsSeparator =
-            lastState != static_cast<UINT>(-1) && (lastState & MF_SEPARATOR) != 0;
-
-        if (!lastIsSeparator) {
-            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        }
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_UNCHECKED,
-            kAlwaysOnTopCommandId,
-            L"&Always on Top");
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            kHideWindowCommandId,
-            L"Hide &Window");
+    // If the host already has a separator right where we're about to land,
+    // reuse it rather than stacking a second one - but leave it in place
+    // rather than deleting and replacing it: it may be one the host still
+    // relies on once our own items are gone again (e.g. the separator
+    // before "Close"), so only a separator we actually add ourselves is
+    // ever safe to remove later. Track which case this was via a window
+    // property so StripAlwaysOnTopItems knows whether it's safe to remove.
+    const bool hostAlreadyHasSeparator =
+        insertPos > 0 && (GetMenuState(menu, insertPos - 1, MF_BYPOSITION) & MF_SEPARATOR) != 0;
+    if (hostAlreadyHasSeparator) {
+        RemovePropW(hwnd, kOwnsLeadingSeparatorProp);
+    } else {
+        InsertMenuW(menu, insertPos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+        ++insertPos;
+        SetPropW(hwnd, kOwnsLeadingSeparatorProp, reinterpret_cast<HANDLE>(1));
     }
+
+    InsertMenuW(
+        menu,
+        insertPos,
+        MF_BYPOSITION | MF_STRING,
+        kAlwaysOnTopCommandId,
+        L"&Always on Top");
+    InsertMenuW(
+        menu,
+        insertPos + 1,
+        MF_BYPOSITION | MF_STRING,
+        kHideWindowCommandId,
+        L"Hide &Window");
+    InsertMenuW(menu, insertPos + 2, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
 
     UpdateMenuCheckState(hwnd, menu);
 }
@@ -165,19 +199,12 @@ void RefreshSystemMenu(HWND hwnd, HMENU menu)
     EnsureAlwaysOnTopMenu(hwnd);
 }
 
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
-{
-    EnsureAlwaysOnTopMenu(hwnd);
-    return TRUE;
-}
-
 LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code >= 0) {
-        if (code == HSHELL_WINDOWCREATED) {
-            EnsureAlwaysOnTopMenu(reinterpret_cast<HWND>(wParam));
-        } else if (code == HSHELL_WINDOWDESTROYED) {
+        if (code == HSHELL_WINDOWDESTROYED) {
             RemovePropW(reinterpret_cast<HWND>(wParam), kHiddenProp);
+            RemovePropW(reinterpret_cast<HWND>(wParam), kOwnsLeadingSeparatorProp);
         }
     }
 
@@ -188,18 +215,27 @@ LRESULT CALLBACK CallWndProcRetHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code >= 0) {
         const auto* callInfo = reinterpret_cast<CWPRETSTRUCT*>(lParam);
+
         // WM_INITMENUPOPUP is sent after WM_INITMENU, right before the popup is
         // actually shown - the last point in the sequence, and (per observed
         // Chromium behavior) where hosts like Brave do their own dynamic-item
-        // rebuild (e.g. "Reopen closed tab"), not in WM_INITMENU. HIWORD(lParam)
-        // is nonzero specifically for the window/system menu (MSDN). Reacting
+        // rebuild (e.g. "Reopen closed tab"), not in WM_INITMENU. Reacting
         // here, via WH_CALLWNDPROCRET (fires after the target wndproc has
         // already handled the message), means the host has always finished its
         // own rebuild by the time we touch the menu, so we're never the one
         // racing it into duplicating its own items.
-        if (callInfo != nullptr &&
-            callInfo->message == WM_INITMENUPOPUP &&
-            HIWORD(callInfo->lParam) != 0) {
+        //
+        // MSDN documents HIWORD(lParam) as nonzero specifically for the
+        // window/system menu, but captured logs show Brave's real system-menu
+        // popup reports HIWORD == 0 - its custom title bar likely drives
+        // TrackPopupMenu itself rather than going through the normal
+        // SC_MOUSEMENU path Windows expects that flag to reflect. Skip the
+        // flag entirely and let RefreshSystemMenu's own identity check (is
+        // this popup literally GetSystemMenu(hwnd, FALSE)?) decide instead -
+        // that's accurate regardless of how the host triggered the popup, and
+        // it also means we re-fix on every open rather than only once at
+        // window creation, so we keep catching up with any later rebuild.
+        if (callInfo != nullptr && callInfo->message == WM_INITMENUPOPUP) {
             RefreshSystemMenu(
                 callInfo->hwnd,
                 reinterpret_cast<HMENU>(callInfo->wParam));
@@ -245,23 +281,8 @@ void RemoveAlwaysOnTopMenu(HWND hwnd)
         return;
     }
 
-    // Drop the separator we added immediately before our own item, if it's
-    // still there, then remove both items by id regardless of position.
-    const int count = GetMenuItemCount(menu);
-    for (int i = 0; i < count; ++i) {
-        if (GetMenuItemID(menu, i) == kAlwaysOnTopCommandId) {
-            if (i > 0) {
-                const UINT prevState = GetMenuState(menu, i - 1, MF_BYPOSITION);
-                if (prevState != static_cast<UINT>(-1) && (prevState & MF_SEPARATOR) != 0) {
-                    RemoveMenu(menu, i - 1, MF_BYPOSITION);
-                }
-            }
-            break;
-        }
-    }
-
-    RemoveMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
-    RemoveMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
+    StripAlwaysOnTopItems(hwnd, menu);
+    RemovePropW(hwnd, kOwnsLeadingSeparatorProp);
 }
 
 void RestoreHiddenWindow(HWND hwnd)
@@ -300,7 +321,15 @@ extern "C" __declspec(dllexport) bool Aot_Start()
         g_getMessageHook = SetWindowsHookExW(WH_GETMESSAGE, GetMessageHookProc, g_instance, 0);
     }
 
-    EnumWindows(EnumWindowsProc, 0);
+    // Deliberately not populated eagerly here (or on window creation): for
+    // Chromium hosts, doing so before the user has ever opened the menu
+    // races their own lazy-built dynamic content (e.g. Brave's "Reopen closed
+    // tab" section), which doesn't exist yet at this point. Our insert then
+    // consumes the plain window's still-generic trailing separator for its
+    // own boundary, leaving nothing where the host's own content later
+    // expects one already there. EnsureAlwaysOnTopMenu only ever runs from
+    // WM_INITMENUPOPUP (see RefreshSystemMenu), by which point the host has
+    // always finished building whatever it's going to build for this open.
     return g_shellHook != nullptr &&
            g_callWndProcRetHook != nullptr &&
            g_getMessageHook != nullptr;
