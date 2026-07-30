@@ -7,7 +7,7 @@ namespace {
 HINSTANCE g_instance = nullptr;
 HHOOK g_shellHook = nullptr;
 HHOOK g_getMessageHook = nullptr;
-HHOOK g_callWndProcHook = nullptr;
+HHOOK g_callWndProcRetHook = nullptr;
 
 [[nodiscard]] HWND ResolveRootWindow(HWND hwnd)
 {
@@ -184,18 +184,29 @@ LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_shellHook, code, wParam, lParam);
 }
 
-LRESULT CALLBACK CallWndProcHookProc(int code, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK CallWndProcRetHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code >= 0) {
-        const auto* callInfo = reinterpret_cast<CWPSTRUCT*>(lParam);
-        if (callInfo != nullptr && callInfo->message == WM_INITMENU) {
+        const auto* callInfo = reinterpret_cast<CWPRETSTRUCT*>(lParam);
+        // WH_CALLWNDPROCRET fires after the target window's own wndproc has
+        // handled the message, unlike WH_CALLWNDPROC/WH_GETMESSAGE which fire
+        // before. Chromium hosts (Brave in particular) rebuild dynamic entries
+        // of their own (e.g. "Reopen closed tab") in their WM_INITMENU handler;
+        // touching the menu ahead of that rebuild raced it and left it
+        // confused about where its own items were from one open to the next,
+        // producing duplicates. Waiting until after it's done removes us from
+        // that race entirely - we always add our pair last, onto its final,
+        // already-settled menu.
+        if (callInfo != nullptr &&
+            (callInfo->message == WM_INITMENU ||
+             (callInfo->message == WM_INITMENUPOPUP && HIWORD(callInfo->lParam) == 0))) {
             RefreshSystemMenu(
                 callInfo->hwnd,
                 reinterpret_cast<HMENU>(callInfo->wParam));
         }
     }
 
-    return CallNextHookEx(g_callWndProcHook, code, wParam, lParam);
+    return CallNextHookEx(g_callWndProcRetHook, code, wParam, lParam);
 }
 
 LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
@@ -207,13 +218,8 @@ LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
         }
 
         HWND hwnd = ResolveRootWindow(message->hwnd);
-        if (message->message == WM_INITMENU) {
-            RefreshSystemMenu(hwnd, reinterpret_cast<HMENU>(message->wParam));
-        } else if (message->message == WM_INITMENUPOPUP &&
-                   HIWORD(message->lParam) == 0) {
-            RefreshSystemMenu(hwnd, reinterpret_cast<HMENU>(message->wParam));
-        } else if (message->message == WM_SYSCOMMAND &&
-                   (message->wParam & 0xFFF0) == kAlwaysOnTopCommandId) {
+        if (message->message == WM_SYSCOMMAND &&
+            (message->wParam & 0xFFF0) == kAlwaysOnTopCommandId) {
             ToggleAlwaysOnTop(hwnd);
 
             HMENU menu = GetSystemMenu(hwnd, FALSE);
@@ -285,9 +291,9 @@ extern "C" __declspec(dllexport) bool Aot_Start()
         g_shellHook = SetWindowsHookExW(WH_SHELL, ShellHookProc, g_instance, 0);
     }
 
-    if (g_callWndProcHook == nullptr) {
-        g_callWndProcHook =
-            SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHookProc, g_instance, 0);
+    if (g_callWndProcRetHook == nullptr) {
+        g_callWndProcRetHook =
+            SetWindowsHookExW(WH_CALLWNDPROCRET, CallWndProcRetHookProc, g_instance, 0);
     }
 
     if (g_getMessageHook == nullptr) {
@@ -296,7 +302,7 @@ extern "C" __declspec(dllexport) bool Aot_Start()
 
     EnumWindows(EnumWindowsProc, 0);
     return g_shellHook != nullptr &&
-           g_callWndProcHook != nullptr &&
+           g_callWndProcRetHook != nullptr &&
            g_getMessageHook != nullptr;
 }
 
@@ -307,9 +313,9 @@ extern "C" __declspec(dllexport) void Aot_Unhook()
         g_shellHook = nullptr;
     }
 
-    if (g_callWndProcHook != nullptr) {
-        UnhookWindowsHookEx(g_callWndProcHook);
-        g_callWndProcHook = nullptr;
+    if (g_callWndProcRetHook != nullptr) {
+        UnhookWindowsHookEx(g_callWndProcRetHook);
+        g_callWndProcRetHook = nullptr;
     }
 
     if (g_getMessageHook != nullptr) {
