@@ -188,18 +188,18 @@ LRESULT CALLBACK CallWndProcRetHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code >= 0) {
         const auto* callInfo = reinterpret_cast<CWPRETSTRUCT*>(lParam);
-        // WH_CALLWNDPROCRET fires after the target window's own wndproc has
-        // handled the message, unlike WH_CALLWNDPROC/WH_GETMESSAGE which fire
-        // before. Chromium hosts (Brave in particular) rebuild dynamic entries
-        // of their own (e.g. "Reopen closed tab") in their WM_INITMENU handler;
-        // touching the menu ahead of that rebuild raced it and left it
-        // confused about where its own items were from one open to the next,
-        // producing duplicates. Waiting until after it's done removes us from
-        // that race entirely - we always add our pair last, onto its final,
-        // already-settled menu.
+        // WM_INITMENUPOPUP is sent after WM_INITMENU, right before the popup is
+        // actually shown - the last point in the sequence, and (per observed
+        // Chromium behavior) where hosts like Brave do their own dynamic-item
+        // rebuild (e.g. "Reopen closed tab"), not in WM_INITMENU. HIWORD(lParam)
+        // is nonzero specifically for the window/system menu (MSDN). Reacting
+        // here, via WH_CALLWNDPROCRET (fires after the target wndproc has
+        // already handled the message), means the host has always finished its
+        // own rebuild by the time we touch the menu, so we're never the one
+        // racing it into duplicating its own items.
         if (callInfo != nullptr &&
-            (callInfo->message == WM_INITMENU ||
-             (callInfo->message == WM_INITMENUPOPUP && HIWORD(callInfo->lParam) == 0))) {
+            callInfo->message == WM_INITMENUPOPUP &&
+            HIWORD(callInfo->lParam) != 0) {
             RefreshSystemMenu(
                 callInfo->hwnd,
                 reinterpret_cast<HMENU>(callInfo->wParam));
