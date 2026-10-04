@@ -11,6 +11,7 @@ Right-click a window title bar (or its taskbar button, or press Alt+Space) and t
 - When a window's system menu opens, **Always on Top** and **Hide Window** items are injected.
 - Selecting **Always on Top** toggles `HWND_TOPMOST` via `SetWindowPos`.
 - Selecting **Hide Window** calls `ShowWindow(SW_HIDE)` and tags the window so it shows up in the Manage Windows dialog.
+- Optionally (tray menu → **Hidden Windows in Tray**, off by default), each hidden window also gets its own tray icon, using its process's icon and name; left-click it to restore the window, right-click for a menu.
 - The tray icon's **Manage Windows** dialog lists every pinned and/or hidden window (with its state) and can unpin/unhide them, individually or all at once.
 - The app follows the system light/dark theme setting for its own dialogs.
 

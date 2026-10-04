@@ -76,6 +76,13 @@ void HideWindow(HWND hwnd)
 {
     ShowWindow(hwnd, SW_HIDE);
     SetPropW(hwnd, kHiddenProp, reinterpret_cast<HANDLE>(1));
+
+    // Let the host know so it can add a tray icon for the hidden window.
+    HWND host = FindWindowW(kHostWindowClassName, nullptr);
+    const UINT message = RegisterWindowMessageW(kHiddenStateChangedMessageName);
+    if (host != nullptr && message != 0) {
+        PostMessageW(host, message, 0, 0);
+    }
 }
 
 // Window property marking that we added the separator immediately before our

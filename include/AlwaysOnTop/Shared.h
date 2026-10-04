@@ -23,6 +23,13 @@ constexpr UINT kHideWindowCommandId = 0x1010;
 // Window property marking that we hid this window; only our own dialog unhides it.
 constexpr const wchar_t* kHiddenProp = L"AlwaysOnTop.Hidden";
 
+// Host tray window class; the hook DLL looks it up to notify the host.
+constexpr const wchar_t* kHostWindowClassName = L"AlwaysOnTopHostWindow";
+
+// Registered message the hook DLL posts to the host window whenever it hides a
+// window, so the host can add a tray icon for it without polling.
+constexpr const wchar_t* kHiddenStateChangedMessageName = L"AlwaysOnTop.HiddenStateChanged";
+
 // Export names used by the host executable.
 constexpr const char* kStartHooksExport = "Aot_Start";
 constexpr const char* kStopHooksExport = "Aot_Stop";

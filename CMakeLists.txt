@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AlwaysOnTop VERSION 0.4.9 LANGUAGES CXX)
+project(AlwaysOnTop VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,7 +40,7 @@ add_executable(AlwaysOnTop WIN32
 
 target_include_directories(AlwaysOnTop PRIVATE include resources ${CMAKE_BINARY_DIR}/generated)
 target_compile_definitions(AlwaysOnTop PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
-target_link_libraries(AlwaysOnTop PRIVATE user32 shell32 comctl32 dwmapi uxtheme winhttp)
+target_link_libraries(AlwaysOnTop PRIVATE user32 shell32 comctl32 dwmapi uxtheme winhttp version)
 
 # The manifest is embedded manually via RT_MANIFEST in AlwaysOnTop.rc (for
 # Common Controls v6 + DPI awareness); disable the linker's own manifest

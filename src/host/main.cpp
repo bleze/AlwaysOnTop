@@ -9,6 +9,7 @@
 #include <shellapi.h>
 #include <uxtheme.h>
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,7 +25,13 @@ constexpr UINT kAboutMenuId = 1000;
 constexpr UINT kQuitMenuId = 1001;
 constexpr UINT kManageMenuId = 1002;
 constexpr UINT kCheckUpdatesMenuId = 1003;
-constexpr wchar_t kWindowClassName[] = L"AlwaysOnTopHostWindow";
+constexpr UINT kHiddenTrayIconsMenuId = 1004;
+constexpr UINT kRestoreHiddenMenuId = 1005;
+constexpr UINT kMainTrayIconId = 1;
+// Per-hidden-window tray icons get ids from here up, so they never collide
+// with the main icon.
+constexpr UINT kFirstHiddenTrayIconId = 100;
+constexpr const wchar_t* kWindowClassName = kHostWindowClassName;
 constexpr wchar_t kMutexName[] = L"Global\\AlwaysOnTop_SingleInstance";
 // Named per-version (see the matching comment on the CMake target) so a
 // self-update never has to rename or delete a copy some other process still
@@ -37,9 +44,16 @@ constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
 constexpr wchar_t kManageMenuText[] = L"&Manage Windows...";
 constexpr wchar_t kCheckUpdatesMenuText[] = L"Check for &Updates";
+constexpr wchar_t kHiddenTrayIconsMenuText[] = L"Hidden Windows in &Tray";
 constexpr wchar_t kQuitMenuText[] = L"&Quit";
 constexpr UINT_PTR kUpdateCheckTimerId = 1;
 constexpr UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
+// Catches hidden windows that were destroyed or shown again by their own app,
+// neither of which notifies us.
+constexpr UINT_PTR kHiddenTraySyncTimerId = 2;
+constexpr UINT kHiddenTraySyncIntervalMs = 2000;
+constexpr wchar_t kSettingsKeyPath[] = L"Software\\AlwaysOnTop";
+constexpr wchar_t kHiddenTrayIconsValueName[] = L"HiddenWindowTrayIcons";
 
 using StartHooksFn = bool (*)();
 using StopHooksFn = void (*)();
@@ -53,11 +67,24 @@ HICON g_appIcon = nullptr;
 HICON g_quitIcon = nullptr;
 HICON g_manageIcon = nullptr;
 HICON g_updateIcon = nullptr;
+HICON g_checkIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
 UnhookOnlyFn g_unhookOnly = nullptr;
 HBRUSH g_darkDialogBrush = nullptr;
+UINT g_hiddenStateChangedMessage = 0;
+UINT g_taskbarCreatedMessage = 0;
+
+struct HiddenTrayIcon {
+    HWND window;
+    UINT id;
+    HICON icon;
+};
+
+bool g_hiddenTrayIconsEnabled = false;
+std::vector<HiddenTrayIcon> g_hiddenTrayIcons;
+UINT g_nextHiddenTrayIconId = kFirstHiddenTrayIconId;
 
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK ManageDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
@@ -354,6 +381,15 @@ template <typename DrawGlyphFn>
     });
 }
 
+[[nodiscard]] HICON CreateCheckIcon(int size)
+{
+    return CreateGlyphIcon(size, RGB(0, 120, 215), [](HDC dc, int s) {
+        MoveToEx(dc, s / 5, s / 2, nullptr);
+        LineTo(dc, (s * 2) / 5, (s * 3) / 4);
+        LineTo(dc, s - s / 5, s / 4);
+    });
+}
+
 void DrawMenuIconAndText(const DRAWITEMSTRUCT& item, HICON icon, const wchar_t* text)
 {
     const bool selected = (item.itemState & ODS_SELECTED) != 0;
@@ -543,6 +579,248 @@ void PopulateManageList(HWND dialog)
     }
 }
 
+[[nodiscard]] bool LoadHiddenTrayIconsSetting()
+{
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        kSettingsKeyPath,
+        kHiddenTrayIconsValueName,
+        RRF_RT_REG_DWORD,
+        nullptr,
+        &value,
+        &size);
+    return status == ERROR_SUCCESS && value != 0;
+}
+
+void SaveHiddenTrayIconsSetting(bool enabled)
+{
+    const DWORD value = enabled ? 1 : 0;
+    RegSetKeyValueW(
+        HKEY_CURRENT_USER,
+        kSettingsKeyPath,
+        kHiddenTrayIconsValueName,
+        REG_DWORD,
+        &value,
+        sizeof(value));
+}
+
+[[nodiscard]] std::wstring GetWindowProcessPath(HWND hwnd)
+{
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return {};
+    }
+
+    std::wstring path(1024, L'\0');
+    DWORD size = static_cast<DWORD>(path.size());
+    const bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &size) != FALSE;
+    CloseHandle(process);
+    if (!ok) {
+        return {};
+    }
+
+    path.resize(size);
+    return path;
+}
+
+// The executable's FileDescription (e.g. "Brave Browser"), falling back to its
+// file name without extension.
+[[nodiscard]] std::wstring GetProcessDisplayName(const std::wstring& processPath)
+{
+    if (processPath.empty()) {
+        return {};
+    }
+
+    DWORD ignored = 0;
+    const DWORD infoSize = GetFileVersionInfoSizeW(processPath.c_str(), &ignored);
+    if (infoSize > 0) {
+        std::vector<BYTE> info(infoSize);
+        if (GetFileVersionInfoW(processPath.c_str(), 0, infoSize, info.data())) {
+            struct LanguageCodePage {
+                WORD language;
+                WORD codePage;
+            };
+            LanguageCodePage* translations = nullptr;
+            UINT translationsSize = 0;
+            if (VerQueryValueW(
+                    info.data(),
+                    L"\\VarFileInfo\\Translation",
+                    reinterpret_cast<void**>(&translations),
+                    &translationsSize) &&
+                translationsSize >= sizeof(LanguageCodePage)) {
+                wchar_t subBlock[64] = {};
+                swprintf_s(
+                    subBlock,
+                    L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                    translations[0].language,
+                    translations[0].codePage);
+
+                wchar_t* description = nullptr;
+                UINT descriptionLength = 0;
+                if (VerQueryValueW(
+                        info.data(),
+                        subBlock,
+                        reinterpret_cast<void**>(&description),
+                        &descriptionLength) &&
+                    descriptionLength > 1 && description[0] != L'\0') {
+                    return description;
+                }
+            }
+        }
+    }
+
+    std::wstring name = processPath;
+    const auto slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        name.erase(0, slash + 1);
+    }
+    const auto dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) {
+        name.erase(dot);
+    }
+    return name;
+}
+
+// Returns an icon this process owns (the caller destroys it): the process
+// executable's own icon, falling back to the window's icon, then a generic one.
+[[nodiscard]] HICON LoadHiddenWindowIcon(HWND hwnd, const std::wstring& processPath)
+{
+    HICON icon = nullptr;
+    if (!processPath.empty() &&
+        ExtractIconExW(processPath.c_str(), 0, nullptr, &icon, 1) > 0 &&
+        icon != nullptr) {
+        return icon;
+    }
+
+    // Window/class icons belong to the other process and may go away with it,
+    // so take our own copy.
+    DWORD_PTR windowIcon = 0;
+    if (SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 200, &windowIcon) &&
+        windowIcon != 0) {
+        return CopyIcon(reinterpret_cast<HICON>(windowIcon));
+    }
+
+    const auto classIcon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
+    if (classIcon != nullptr) {
+        return CopyIcon(classIcon);
+    }
+
+    return CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
+}
+
+[[nodiscard]] NOTIFYICONDATAW MakeHiddenTrayIconData(const HiddenTrayIcon& entry)
+{
+    NOTIFYICONDATAW data = {};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_hostWindow;
+    data.uID = entry.id;
+    return data;
+}
+
+void AddHiddenTrayIcon(HWND hwnd)
+{
+    const std::wstring processPath = GetWindowProcessPath(hwnd);
+    const std::wstring name = GetProcessDisplayName(processPath);
+
+    wchar_t title[128] = {};
+    GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+
+    std::wstring tip = name.empty() ? std::wstring(title) : name;
+    if (!name.empty() && title[0] != L'\0' && name != title) {
+        tip += L"\n";
+        tip += title;
+    }
+    tip += L"\nHidden - click to restore";
+
+    const HiddenTrayIcon entry = {hwnd, g_nextHiddenTrayIconId++, LoadHiddenWindowIcon(hwnd, processPath)};
+
+    NOTIFYICONDATAW data = MakeHiddenTrayIconData(entry);
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = kTrayCallbackMessage;
+    data.hIcon = entry.icon;
+    wcsncpy_s(data.szTip, tip.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_ADD, &data);
+
+    g_hiddenTrayIcons.push_back(entry);
+}
+
+void RemoveHiddenTrayIcon(const HiddenTrayIcon& entry)
+{
+    NOTIFYICONDATAW data = MakeHiddenTrayIconData(entry);
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    if (entry.icon != nullptr) {
+        DestroyIcon(entry.icon);
+    }
+}
+
+void RemoveAllHiddenTrayIcons()
+{
+    for (const HiddenTrayIcon& entry : g_hiddenTrayIcons) {
+        RemoveHiddenTrayIcon(entry);
+    }
+    g_hiddenTrayIcons.clear();
+}
+
+BOOL CALLBACK CollectHiddenWindowsProc(HWND hwnd, LPARAM lParam)
+{
+    // A window its own app has since shown again still carries our property,
+    // but there's nothing left to restore from the tray.
+    if (IsHidden(hwnd) && !IsWindowVisible(hwnd)) {
+        reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
+    }
+    return TRUE;
+}
+
+// Makes the per-window tray icons match the set of windows currently hidden by
+// us: adds icons for newly hidden windows and drops icons for ones that were
+// restored, shown again by their own app, or destroyed.
+void SyncHiddenTrayIcons()
+{
+    std::vector<HWND> hidden;
+    if (g_hiddenTrayIconsEnabled) {
+        EnumWindows(CollectHiddenWindowsProc, reinterpret_cast<LPARAM>(&hidden));
+    }
+
+    std::erase_if(g_hiddenTrayIcons, [&](const HiddenTrayIcon& entry) {
+        if (std::find(hidden.begin(), hidden.end(), entry.window) != hidden.end()) {
+            return false;
+        }
+        RemoveHiddenTrayIcon(entry);
+        return true;
+    });
+
+    for (HWND hwnd : hidden) {
+        const bool known = std::any_of(
+            g_hiddenTrayIcons.begin(),
+            g_hiddenTrayIcons.end(),
+            [hwnd](const HiddenTrayIcon& entry) { return entry.window == hwnd; });
+        if (!known) {
+            AddHiddenTrayIcon(hwnd);
+        }
+    }
+}
+
+void SetHiddenTrayIconsEnabled(bool enabled)
+{
+    g_hiddenTrayIconsEnabled = enabled;
+    if (enabled) {
+        SetTimer(g_hostWindow, kHiddenTraySyncTimerId, kHiddenTraySyncIntervalMs, nullptr);
+    } else {
+        KillTimer(g_hostWindow, kHiddenTraySyncTimerId);
+    }
+    SyncHiddenTrayIcons();
+}
+
+void UnhideWindow(HWND hwnd)
+{
+    ShowWindow(hwnd, SW_SHOW);
+    RemovePropW(hwnd, kHiddenProp);
+}
+
 void RestoreWindow(HWND hwnd)
 {
     if (hwnd == nullptr || !IsWindow(hwnd)) {
@@ -561,8 +839,7 @@ void RestoreWindow(HWND hwnd)
     }
 
     if (IsHidden(hwnd)) {
-        ShowWindow(hwnd, SW_SHOW);
-        RemovePropW(hwnd, kHiddenProp);
+        UnhideWindow(hwnd);
     }
 }
 
@@ -579,6 +856,7 @@ void RestoreSelectedWindows(HWND dialog)
         RestoreWindow(reinterpret_cast<HWND>(item.lParam));
     }
 
+    SyncHiddenTrayIcons();
     PopulateManageList(dialog);
 }
 
@@ -595,6 +873,7 @@ void RestoreAllWindows(HWND dialog)
         RestoreWindow(reinterpret_cast<HWND>(item.lParam));
     }
 
+    SyncHiddenTrayIcons();
     PopulateManageList(dialog);
 }
 
@@ -831,6 +1110,11 @@ void ShowTrayMenu()
     POINT cursor = {};
     GetCursorPos(&cursor);
 
+    CheckMenuItem(
+        g_trayMenu,
+        kHiddenTrayIconsMenuId,
+        MF_BYCOMMAND | (g_hiddenTrayIconsEnabled ? MF_CHECKED : MF_UNCHECKED));
+
     SetForegroundWindow(g_hostWindow);
     TrackPopupMenu(
         g_trayMenu,
@@ -843,11 +1127,91 @@ void ShowTrayMenu()
     PostMessageW(g_hostWindow, WM_NULL, 0, 0);
 }
 
+void RestoreHiddenWindowFromTray(HWND hwnd)
+{
+    if (IsWindow(hwnd) && IsHidden(hwnd)) {
+        UnhideWindow(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+    SyncHiddenTrayIcons();
+}
+
+void ShowHiddenTrayIconMenu(HWND hwnd)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) {
+        return;
+    }
+
+    AppendMenuW(menu, MF_STRING, kRestoreHiddenMenuId, L"&Restore Window");
+    AppendMenuW(menu, MF_STRING, kManageMenuId, kManageMenuText);
+    SetMenuDefaultItem(menu, kRestoreHiddenMenuId, FALSE);
+
+    POINT cursor = {};
+    GetCursorPos(&cursor);
+
+    SetForegroundWindow(g_hostWindow);
+    const UINT command = static_cast<UINT>(TrackPopupMenu(
+        menu,
+        TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+        cursor.x,
+        cursor.y,
+        0,
+        g_hostWindow,
+        nullptr));
+    PostMessageW(g_hostWindow, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    if (command == kRestoreHiddenMenuId) {
+        RestoreHiddenWindowFromTray(hwnd);
+    } else if (command == kManageMenuId) {
+        ShowManageDialog();
+    }
+}
+
+void HandleHiddenTrayIconEvent(UINT iconId, UINT mouseMessage)
+{
+    const auto entry = std::find_if(
+        g_hiddenTrayIcons.begin(),
+        g_hiddenTrayIcons.end(),
+        [iconId](const HiddenTrayIcon& icon) { return icon.id == iconId; });
+    if (entry == g_hiddenTrayIcons.end()) {
+        return;
+    }
+
+    const HWND window = entry->window;
+    if (mouseMessage == WM_LBUTTONUP) {
+        RestoreHiddenWindowFromTray(window);
+    } else if (mouseMessage == WM_RBUTTONUP) {
+        ShowHiddenTrayIconMenu(window);
+    }
+}
+
+// Explorer restarted, taking every notification icon with it.
+void ReAddTrayIcons()
+{
+    Shell_NotifyIconW(NIM_ADD, &g_trayIcon);
+    RemoveAllHiddenTrayIcons();
+    SyncHiddenTrayIcons();
+}
+
 LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    // Registered messages have runtime ids, so they can't be switch cases.
+    if (message != 0 && message == g_hiddenStateChangedMessage) {
+        SyncHiddenTrayIcons();
+        return 0;
+    }
+    if (message != 0 && message == g_taskbarCreatedMessage) {
+        ReAddTrayIcons();
+        return 0;
+    }
+
     switch (message) {
     case kTrayCallbackMessage:
-        if (LOWORD(lParam) == WM_RBUTTONUP) {
+        if (wParam != kMainTrayIconId) {
+            HandleHiddenTrayIconEvent(static_cast<UINT>(wParam), LOWORD(lParam));
+        } else if (LOWORD(lParam) == WM_RBUTTONUP) {
             ShowTrayMenu();
         }
         return 0;
@@ -859,6 +1223,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             return 0;
         case kManageMenuId:
             ShowManageDialog();
+            return 0;
+        case kHiddenTrayIconsMenuId:
+            SetHiddenTrayIconsEnabled(!g_hiddenTrayIconsEnabled);
+            SaveHiddenTrayIconsSetting(g_hiddenTrayIconsEnabled);
             return 0;
         case kCheckUpdatesMenuId:
             CheckForUpdatesAsync(hwnd, true);
@@ -882,13 +1250,15 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_TIMER:
         if (wParam == kUpdateCheckTimerId) {
             CheckForUpdatesAsync(hwnd, false);
+        } else if (wParam == kHiddenTraySyncTimerId) {
+            SyncHiddenTrayIcons();
         }
         return 0;
 
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (measure != nullptr && measure->CtlType == ODT_MENU) {
-            measure->itemWidth = 180;
+            measure->itemWidth = 200;
             measure->itemHeight = kMenuItemHeight;
             return TRUE;
         }
@@ -901,6 +1271,12 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             switch (drawItem->itemID) {
             case kManageMenuId:
                 DrawMenuIconAndText(*drawItem, g_manageIcon, kManageMenuText);
+                return TRUE;
+            case kHiddenTrayIconsMenuId:
+                DrawMenuIconAndText(
+                    *drawItem,
+                    (drawItem->itemState & ODS_CHECKED) != 0 ? g_checkIcon : nullptr,
+                    kHiddenTrayIconsMenuText);
                 return TRUE;
             case kCheckUpdatesMenuId:
                 DrawMenuIconAndText(*drawItem, g_updateIcon, kCheckUpdatesMenuText);
@@ -920,6 +1296,8 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 
     case WM_DESTROY:
         KillTimer(hwnd, kUpdateCheckTimerId);
+        KillTimer(hwnd, kHiddenTraySyncTimerId);
+        RemoveAllHiddenTrayIcons();
         RemoveTrayIcon();
         if (g_trayMenu != nullptr) {
             DestroyMenu(g_trayMenu);
@@ -940,6 +1318,10 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_updateIcon != nullptr) {
             DestroyIcon(g_updateIcon);
             g_updateIcon = nullptr;
+        }
+        if (g_checkIcon != nullptr) {
+            DestroyIcon(g_checkIcon);
+            g_checkIcon = nullptr;
         }
         if (g_darkDialogBrush != nullptr) {
             DeleteObject(g_darkDialogBrush);
@@ -994,6 +1376,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     g_quitIcon = CreateQuitIcon(kMenuIconSize);
     g_manageIcon = CreateManageIcon(kMenuIconSize);
     g_updateIcon = CreateUpdateIcon(kMenuIconSize);
+    g_checkIcon = CreateCheckIcon(kMenuIconSize);
 
     g_trayMenu = CreatePopupMenu();
     if (g_trayMenu == nullptr) {
@@ -1001,6 +1384,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     }
 
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kManageMenuId, nullptr);
+    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kHiddenTrayIconsMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kCheckUpdatesMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
@@ -1011,7 +1395,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     g_trayIcon = {};
     g_trayIcon.cbSize = sizeof(g_trayIcon);
     g_trayIcon.hWnd = g_hostWindow;
-    g_trayIcon.uID = 1;
+    g_trayIcon.uID = kMainTrayIconId;
     g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_trayIcon.uCallbackMessage = kTrayCallbackMessage;
     g_trayIcon.hIcon = g_appIcon;
@@ -1069,6 +1453,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
 
     CleanupStaleHookDlls();
+
+    // The hook DLL posts from inside other processes, some possibly at a
+    // lower integrity level, so let its notification through UIPI;
+    // TaskbarCreated likewise needs letting through when we run elevated.
+    g_hiddenStateChangedMessage = RegisterWindowMessageW(kHiddenStateChangedMessageName);
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    ChangeWindowMessageFilterEx(g_hostWindow, g_hiddenStateChangedMessage, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g_hostWindow, g_taskbarCreatedMessage, MSGFLT_ALLOW, nullptr);
+
+    // Also picks up windows a previous instance left hidden (e.g. across a
+    // self-update).
+    SetHiddenTrayIconsEnabled(LoadHiddenTrayIconsSetting());
 
     CheckForUpdatesAsync(g_hostWindow, false);
     SetTimer(g_hostWindow, kUpdateCheckTimerId, kUpdateCheckIntervalMs, nullptr);
