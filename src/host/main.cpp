@@ -25,7 +25,6 @@ constexpr UINT kAboutMenuId = 1000;
 constexpr UINT kQuitMenuId = 1001;
 constexpr UINT kManageMenuId = 1002;
 constexpr UINT kCheckUpdatesMenuId = 1003;
-constexpr UINT kHiddenTrayIconsMenuId = 1004;
 constexpr UINT kRestoreHiddenMenuId = 1005;
 constexpr UINT kMainTrayIconId = 1;
 // Per-hidden-window tray icons get ids from here up, so they never collide
@@ -44,7 +43,6 @@ constexpr int kMenuItemHeight = 22;
 constexpr wchar_t kAboutMenuText[] = L"&About AlwaysOnTop...";
 constexpr wchar_t kManageMenuText[] = L"&Manage Windows...";
 constexpr wchar_t kCheckUpdatesMenuText[] = L"Check for &Updates";
-constexpr wchar_t kHiddenTrayIconsMenuText[] = L"Hidden Windows in &Tray";
 constexpr wchar_t kQuitMenuText[] = L"&Quit";
 constexpr UINT_PTR kUpdateCheckTimerId = 1;
 constexpr UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
@@ -52,8 +50,6 @@ constexpr UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
 // neither of which notifies us.
 constexpr UINT_PTR kHiddenTraySyncTimerId = 2;
 constexpr UINT kHiddenTraySyncIntervalMs = 2000;
-constexpr wchar_t kSettingsKeyPath[] = L"Software\\AlwaysOnTop";
-constexpr wchar_t kHiddenTrayIconsValueName[] = L"HiddenWindowTrayIcons";
 
 using StartHooksFn = bool (*)();
 using StopHooksFn = void (*)();
@@ -67,7 +63,6 @@ HICON g_appIcon = nullptr;
 HICON g_quitIcon = nullptr;
 HICON g_manageIcon = nullptr;
 HICON g_updateIcon = nullptr;
-HICON g_checkIcon = nullptr;
 HMODULE g_hookModule = nullptr;
 StartHooksFn g_startHooks = nullptr;
 StopHooksFn g_stopHooks = nullptr;
@@ -82,7 +77,6 @@ struct HiddenTrayIcon {
     HICON icon;
 };
 
-bool g_hiddenTrayIconsEnabled = false;
 std::vector<HiddenTrayIcon> g_hiddenTrayIcons;
 UINT g_nextHiddenTrayIconId = kFirstHiddenTrayIconId;
 
@@ -381,15 +375,6 @@ template <typename DrawGlyphFn>
     });
 }
 
-[[nodiscard]] HICON CreateCheckIcon(int size)
-{
-    return CreateGlyphIcon(size, RGB(0, 120, 215), [](HDC dc, int s) {
-        MoveToEx(dc, s / 5, s / 2, nullptr);
-        LineTo(dc, (s * 2) / 5, (s * 3) / 4);
-        LineTo(dc, s - s / 5, s / 4);
-    });
-}
-
 void DrawMenuIconAndText(const DRAWITEMSTRUCT& item, HICON icon, const wchar_t* text)
 {
     const bool selected = (item.itemState & ODS_SELECTED) != 0;
@@ -510,16 +495,22 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
     return GetPropW(hwnd, kHiddenProp) != nullptr;
 }
 
-[[nodiscard]] std::wstring BuildStateText(bool pinned, bool hidden)
+[[nodiscard]] bool IsHiddenInTray(HWND hwnd)
 {
+    return IsHidden(hwnd) && GetPropW(hwnd, kHiddenInTrayProp) != nullptr;
+}
+
+[[nodiscard]] std::wstring BuildStateText(bool pinned, bool hidden, bool inTray)
+{
+    const wchar_t* hiddenText = inTray ? L"Hidden in Tray" : L"Hidden";
     if (pinned && hidden) {
-        return L"Pinned + Hidden";
+        return std::wstring(L"Pinned + ") + hiddenText;
     }
     if (pinned) {
         return L"Pinned";
     }
     if (hidden) {
-        return L"Hidden";
+        return hiddenText;
     }
     return L"";
 }
@@ -573,37 +564,10 @@ void PopulateManageList(HWND dialog)
             continue;
         }
 
-        std::wstring state = BuildStateText(IsPinned(hwnd), IsHidden(hwnd));
+        std::wstring state = BuildStateText(IsPinned(hwnd), IsHidden(hwnd), IsHiddenInTray(hwnd));
         ListView_SetItemText(listView, insertedIndex, 1, state.data());
         ++index;
     }
-}
-
-[[nodiscard]] bool LoadHiddenTrayIconsSetting()
-{
-    DWORD value = 0;
-    DWORD size = sizeof(value);
-    const LSTATUS status = RegGetValueW(
-        HKEY_CURRENT_USER,
-        kSettingsKeyPath,
-        kHiddenTrayIconsValueName,
-        RRF_RT_REG_DWORD,
-        nullptr,
-        &value,
-        &size);
-    return status == ERROR_SUCCESS && value != 0;
-}
-
-void SaveHiddenTrayIconsSetting(bool enabled)
-{
-    const DWORD value = enabled ? 1 : 0;
-    RegSetKeyValueW(
-        HKEY_CURRENT_USER,
-        kSettingsKeyPath,
-        kHiddenTrayIconsValueName,
-        REG_DWORD,
-        &value,
-        sizeof(value));
 }
 
 [[nodiscard]] std::wstring GetWindowProcessPath(HWND hwnd)
@@ -769,21 +733,19 @@ BOOL CALLBACK CollectHiddenWindowsProc(HWND hwnd, LPARAM lParam)
 {
     // A window its own app has since shown again still carries our property,
     // but there's nothing left to restore from the tray.
-    if (IsHidden(hwnd) && !IsWindowVisible(hwnd)) {
+    if (IsHiddenInTray(hwnd) && !IsWindowVisible(hwnd)) {
         reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
     }
     return TRUE;
 }
 
-// Makes the per-window tray icons match the set of windows currently hidden by
-// us: adds icons for newly hidden windows and drops icons for ones that were
-// restored, shown again by their own app, or destroyed.
+// Makes the per-window tray icons match the set of windows currently hidden in
+// the tray by us: adds icons for newly hidden windows and drops icons for ones
+// that were restored, shown again by their own app, or destroyed.
 void SyncHiddenTrayIcons()
 {
     std::vector<HWND> hidden;
-    if (g_hiddenTrayIconsEnabled) {
-        EnumWindows(CollectHiddenWindowsProc, reinterpret_cast<LPARAM>(&hidden));
-    }
+    EnumWindows(CollectHiddenWindowsProc, reinterpret_cast<LPARAM>(&hidden));
 
     std::erase_if(g_hiddenTrayIcons, [&](const HiddenTrayIcon& entry) {
         if (std::find(hidden.begin(), hidden.end(), entry.window) != hidden.end()) {
@@ -802,23 +764,21 @@ void SyncHiddenTrayIcons()
             AddHiddenTrayIcon(hwnd);
         }
     }
-}
 
-void SetHiddenTrayIconsEnabled(bool enabled)
-{
-    g_hiddenTrayIconsEnabled = enabled;
-    if (enabled) {
-        SetTimer(g_hostWindow, kHiddenTraySyncTimerId, kHiddenTraySyncIntervalMs, nullptr);
-    } else {
+    // Only poll while there is something to keep in sync; the hook DLL's
+    // notification restarts it when a window is next hidden in the tray.
+    if (g_hiddenTrayIcons.empty()) {
         KillTimer(g_hostWindow, kHiddenTraySyncTimerId);
+    } else {
+        SetTimer(g_hostWindow, kHiddenTraySyncTimerId, kHiddenTraySyncIntervalMs, nullptr);
     }
-    SyncHiddenTrayIcons();
 }
 
 void UnhideWindow(HWND hwnd)
 {
     ShowWindow(hwnd, SW_SHOW);
     RemovePropW(hwnd, kHiddenProp);
+    RemovePropW(hwnd, kHiddenInTrayProp);
 }
 
 void RestoreWindow(HWND hwnd)
@@ -1110,11 +1070,6 @@ void ShowTrayMenu()
     POINT cursor = {};
     GetCursorPos(&cursor);
 
-    CheckMenuItem(
-        g_trayMenu,
-        kHiddenTrayIconsMenuId,
-        MF_BYCOMMAND | (g_hiddenTrayIconsEnabled ? MF_CHECKED : MF_UNCHECKED));
-
     SetForegroundWindow(g_hostWindow);
     TrackPopupMenu(
         g_trayMenu,
@@ -1224,10 +1179,6 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         case kManageMenuId:
             ShowManageDialog();
             return 0;
-        case kHiddenTrayIconsMenuId:
-            SetHiddenTrayIconsEnabled(!g_hiddenTrayIconsEnabled);
-            SaveHiddenTrayIconsSetting(g_hiddenTrayIconsEnabled);
-            return 0;
         case kCheckUpdatesMenuId:
             CheckForUpdatesAsync(hwnd, true);
             return 0;
@@ -1258,7 +1209,7 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (measure != nullptr && measure->CtlType == ODT_MENU) {
-            measure->itemWidth = 200;
+            measure->itemWidth = 180;
             measure->itemHeight = kMenuItemHeight;
             return TRUE;
         }
@@ -1271,12 +1222,6 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             switch (drawItem->itemID) {
             case kManageMenuId:
                 DrawMenuIconAndText(*drawItem, g_manageIcon, kManageMenuText);
-                return TRUE;
-            case kHiddenTrayIconsMenuId:
-                DrawMenuIconAndText(
-                    *drawItem,
-                    (drawItem->itemState & ODS_CHECKED) != 0 ? g_checkIcon : nullptr,
-                    kHiddenTrayIconsMenuText);
                 return TRUE;
             case kCheckUpdatesMenuId:
                 DrawMenuIconAndText(*drawItem, g_updateIcon, kCheckUpdatesMenuText);
@@ -1318,10 +1263,6 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_updateIcon != nullptr) {
             DestroyIcon(g_updateIcon);
             g_updateIcon = nullptr;
-        }
-        if (g_checkIcon != nullptr) {
-            DestroyIcon(g_checkIcon);
-            g_checkIcon = nullptr;
         }
         if (g_darkDialogBrush != nullptr) {
             DeleteObject(g_darkDialogBrush);
@@ -1376,7 +1317,6 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     g_quitIcon = CreateQuitIcon(kMenuIconSize);
     g_manageIcon = CreateManageIcon(kMenuIconSize);
     g_updateIcon = CreateUpdateIcon(kMenuIconSize);
-    g_checkIcon = CreateCheckIcon(kMenuIconSize);
 
     g_trayMenu = CreatePopupMenu();
     if (g_trayMenu == nullptr) {
@@ -1384,7 +1324,6 @@ LRESULT CALLBACK HostWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     }
 
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kManageMenuId, nullptr);
-    AppendMenuW(g_trayMenu, MF_OWNERDRAW, kHiddenTrayIconsMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_trayMenu, MF_OWNERDRAW, kCheckUpdatesMenuId, nullptr);
     AppendMenuW(g_trayMenu, MF_SEPARATOR, 0, nullptr);
@@ -1464,7 +1403,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     // Also picks up windows a previous instance left hidden (e.g. across a
     // self-update).
-    SetHiddenTrayIconsEnabled(LoadHiddenTrayIconsSetting());
+    SyncHiddenTrayIcons();
 
     CheckForUpdatesAsync(g_hostWindow, false);
     SetTimer(g_hostWindow, kUpdateCheckTimerId, kUpdateCheckIntervalMs, nullptr);

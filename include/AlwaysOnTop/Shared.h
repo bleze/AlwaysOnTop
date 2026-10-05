@@ -19,9 +19,14 @@
 // WM_SYSCOMMAND handling masks wParam with 0xFFF0 before comparing.
 constexpr UINT kAlwaysOnTopCommandId = 0x1000;
 constexpr UINT kHideWindowCommandId = 0x1010;
+constexpr UINT kHideInTrayCommandId = 0x1020;
 
 // Window property marking that we hid this window; only our own dialog unhides it.
 constexpr const wchar_t* kHiddenProp = L"AlwaysOnTop.Hidden";
+
+// Set alongside kHiddenProp when the window was hidden via Hide in Tray, so the
+// host gives it its own tray icon.
+constexpr const wchar_t* kHiddenInTrayProp = L"AlwaysOnTop.HiddenInTray";
 
 // Host tray window class; the hook DLL looks it up to notify the host.
 constexpr const wchar_t* kHostWindowClassName = L"AlwaysOnTopHostWindow";

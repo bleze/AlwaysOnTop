@@ -72,12 +72,17 @@ void UpdateMenuCheckState(HWND hwnd, HMENU menu)
     CheckMenuItem(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND | checkFlags);
 }
 
-void HideWindow(HWND hwnd)
+void HideWindow(HWND hwnd, bool inTray)
 {
     ShowWindow(hwnd, SW_HIDE);
     SetPropW(hwnd, kHiddenProp, reinterpret_cast<HANDLE>(1));
+    if (inTray) {
+        SetPropW(hwnd, kHiddenInTrayProp, reinterpret_cast<HANDLE>(1));
+    } else {
+        RemovePropW(hwnd, kHiddenInTrayProp);
+    }
 
-    // Let the host know so it can add a tray icon for the hidden window.
+    // Let the host know so it can add (or drop) a tray icon for the window.
     HWND host = FindWindowW(kHostWindowClassName, nullptr);
     const UINT message = RegisterWindowMessageW(kHiddenStateChangedMessageName);
     if (host != nullptr && message != 0) {
@@ -98,10 +103,10 @@ constexpr const wchar_t* kOwnsLeadingSeparatorProp = L"AlwaysOnTop.OwnsLeadingSe
 // items are absent.
 void StripAlwaysOnTopItems(HWND hwnd, HMENU menu)
 {
-    // Trailing separator first, by position relative to HideWindow, before
+    // Trailing separator first, by position relative to HideInTray, before
     // anything else shifts indices around.
     for (int i = 0, count = GetMenuItemCount(menu); i < count; ++i) {
-        if (GetMenuItemID(menu, i) == kHideWindowCommandId) {
+        if (GetMenuItemID(menu, i) == kHideInTrayCommandId) {
             if (i + 1 < count) {
                 const UINT nextState = GetMenuState(menu, i + 1, MF_BYPOSITION);
                 if (nextState != static_cast<UINT>(-1) && (nextState & MF_SEPARATOR) != 0) {
@@ -128,6 +133,7 @@ void StripAlwaysOnTopItems(HWND hwnd, HMENU menu)
 
     RemoveMenu(menu, kAlwaysOnTopCommandId, MF_BYCOMMAND);
     RemoveMenu(menu, kHideWindowCommandId, MF_BYCOMMAND);
+    RemoveMenu(menu, kHideInTrayCommandId, MF_BYCOMMAND);
 }
 
 void EnsureAlwaysOnTopMenu(HWND hwnd)
@@ -186,7 +192,13 @@ void EnsureAlwaysOnTopMenu(HWND hwnd)
         MF_BYPOSITION | MF_STRING,
         kHideWindowCommandId,
         L"Hide &Window");
-    InsertMenuW(menu, insertPos + 2, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    InsertMenuW(
+        menu,
+        insertPos + 2,
+        MF_BYPOSITION | MF_STRING,
+        kHideInTrayCommandId,
+        L"Hide in &Tray");
+    InsertMenuW(menu, insertPos + 3, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
 
     UpdateMenuCheckState(hwnd, menu);
 }
@@ -211,6 +223,7 @@ LRESULT CALLBACK ShellHookProc(int code, WPARAM wParam, LPARAM lParam)
     if (code >= 0) {
         if (code == HSHELL_WINDOWDESTROYED) {
             RemovePropW(reinterpret_cast<HWND>(wParam), kHiddenProp);
+            RemovePropW(reinterpret_cast<HWND>(wParam), kHiddenInTrayProp);
             RemovePropW(reinterpret_cast<HWND>(wParam), kOwnsLeadingSeparatorProp);
         }
     }
@@ -273,7 +286,11 @@ LRESULT CALLBACK GetMessageHookProc(int code, WPARAM wParam, LPARAM lParam)
             message->message = WM_NULL;
         } else if (message->message == WM_SYSCOMMAND &&
                    (message->wParam & 0xFFF0) == kHideWindowCommandId) {
-            HideWindow(hwnd);
+            HideWindow(hwnd, false);
+            message->message = WM_NULL;
+        } else if (message->message == WM_SYSCOMMAND &&
+                   (message->wParam & 0xFFF0) == kHideInTrayCommandId) {
+            HideWindow(hwnd, true);
             message->message = WM_NULL;
         }
     }
@@ -297,6 +314,7 @@ void RestoreHiddenWindow(HWND hwnd)
     if (GetPropW(hwnd, kHiddenProp) != nullptr) {
         ShowWindow(hwnd, SW_SHOW);
         RemovePropW(hwnd, kHiddenProp);
+        RemovePropW(hwnd, kHiddenInTrayProp);
     }
 }
 
